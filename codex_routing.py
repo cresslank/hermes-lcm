@@ -9,6 +9,10 @@ policy constants (for example the gpt-5.5 compaction threshold).
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Only these exact normalized bare slugs have a proven 900k Codex OAuth route.
 # Keep them separate from the family fallbacks below so suffixes and synthetic
 # aliases cannot inherit the larger window.
@@ -48,13 +52,17 @@ def _is_openai_codex_route(provider: str | None) -> bool:
     return (provider or "").strip().lower() == "openai-codex"
 
 
-def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | None:
-    """Return LCM's best-known Codex OAuth effective context cap.
+def _codex_oauth_context_cap(
+    model: str | None,
+    provider: str | None,
+    *,
+    api_key: str = "",
+) -> int | None:
+    """Return the active Hermes-resolved Codex OAuth context window.
 
-    This intentionally mirrors Hermes Agent's hardcoded fallback policy, not the
-    direct OpenAI model catalog. A host-provided context_length may be a user
-    override or stale cache entry; Codex OAuth still enforces these lower route
-    windows.
+    Exact proven 900k route names are authoritative. Other Codex routes use
+    Hermes Agent's provider-aware resolver, with the local table retained for
+    compatibility when that resolver is unavailable.
     """
     if not _is_openai_codex_route(provider):
         return None
@@ -64,6 +72,24 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
     exact_cap = _CODEX_OAUTH_EXACT_CONTEXT_CAPS.get(bare_model)
     if exact_cap is not None:
         return exact_cap
+
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        resolved = get_model_context_length(
+            bare_model,
+            api_key=api_key or "",
+            provider=provider or "",
+        )
+        if isinstance(resolved, int) and resolved > 0:
+            return resolved
+    except Exception:
+        logger.debug(
+            "Hermes Codex context resolver unavailable for %s; using LCM fallback",
+            bare_model,
+            exc_info=True,
+        )
+
     for slug, cap in sorted(
         _CODEX_OAUTH_CONTEXT_CAPS.items(), key=lambda item: len(item[0]), reverse=True
     ):
