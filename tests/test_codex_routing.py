@@ -3,11 +3,20 @@
 import sys
 from types import ModuleType
 
+import pytest
+
 import hermes_lcm.codex_routing as codex_routing
 import hermes_lcm.engine as lcm_engine
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+
+
+EXACT_CODEX_900K_MODELS = (
+    "gpt-5.6-terra-900k",
+    "gpt-5.6-sol-900k",
+    "gpt-5.6-luna-900k",
+)
 
 
 def _install_model_metadata_resolver(monkeypatch, resolver):
@@ -62,9 +71,7 @@ def test_codex_oauth_context_cap_uses_lower_live_value_over_static_fallback(monk
     ) == 272_000
 
 
-def test_codex_oauth_context_cap_keeps_existing_fallback_on_resolver_failure(
-    monkeypatch,
-):
+def test_codex_oauth_context_cap_keeps_existing_fallback_on_resolver_failure(monkeypatch):
     def fail_resolver(*args, **kwargs):
         raise RuntimeError("provider metadata unavailable")
 
@@ -114,3 +121,65 @@ def test_engine_uses_resolved_codex_cap_and_forwards_route_credentials(
         }
     finally:
         engine.shutdown()
+
+
+@pytest.mark.parametrize("model", EXACT_CODEX_900K_MODELS)
+def test_exact_codex_900k_routes_receive_proven_cap(model):
+    # The exact table must win without importing provider metadata.
+    assert codex_routing._codex_oauth_context_cap(model, "openai-codex") == 900_000
+
+
+def test_codex_900k_route_matches_normalized_bare_slug():
+    assert (
+        codex_routing._codex_oauth_context_cap(
+            "  openai/GPT-5.6-SOL-900K  ",
+            "  OPENAI-CODEX  ",
+        )
+        == 900_000
+    )
+
+
+@pytest.mark.parametrize("provider", [None, "openai", "openai-codex-proxy"])
+def test_codex_900k_routes_require_exact_provider(provider):
+    assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol-900k", provider) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_cap"),
+    [
+        ("gpt-5.6", 372_000),
+        ("gpt-5.6-preview", 372_000),
+        ("gpt-5.5", 272_000),
+        ("gpt-5.4", 272_000),
+        ("gpt-5.3-codex-spark", 128_000),
+    ],
+)
+def test_existing_codex_route_caps_are_preserved(monkeypatch, model, expected_cap):
+    def fail_resolver(*args, **kwargs):
+        raise RuntimeError("provider metadata unavailable")
+
+    _install_model_metadata_resolver(monkeypatch, fail_resolver)
+    assert codex_routing._codex_oauth_context_cap(model, "openai-codex") == expected_cap
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_cap"),
+    [
+        ("gpt-5.5-900k", 272_000),
+        ("gpt-5.6-terra-900k-pro", 372_000),
+        ("fake-gpt-5.6-sol-900k", 372_000),
+        ("gpt-5.6-luna-900k.fake", 372_000),
+        ("gpt-5.6-900k", 372_000),
+        ("gpt-5.7-terra-900k", 272_000),
+    ],
+)
+def test_900k_suffix_and_malformed_aliases_do_not_gain_900k_cap(
+    monkeypatch,
+    model,
+    expected_cap,
+):
+    def fail_resolver(*args, **kwargs):
+        raise RuntimeError("provider metadata unavailable")
+
+    _install_model_metadata_resolver(monkeypatch, fail_resolver)
+    assert codex_routing._codex_oauth_context_cap(model, "openai-codex") == expected_cap

@@ -13,6 +13,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Only these exact normalized bare slugs have a proven 900k Codex OAuth route.
+# Keep them separate from the family fallbacks below so suffixes and synthetic
+# aliases cannot inherit the larger window.
+_CODEX_OAUTH_EXACT_CONTEXT_CAPS: dict[str, int] = {
+    "gpt-5.6-terra-900k": 900_000,
+    "gpt-5.6-sol-900k": 900_000,
+    "gpt-5.6-luna-900k": 900_000,
+}
+
 # ChatGPT Codex OAuth exposes provider-enforced context windows that can be
 # materially lower than the same model slug on direct OpenAI/OpenRouter routes.
 # Hermes Agent resolves these from chatgpt.com/backend-api/codex/models, with
@@ -51,16 +60,19 @@ def _codex_oauth_context_cap(
 ) -> int | None:
     """Return the active Hermes-resolved Codex OAuth context window.
 
-    ``get_model_context_length`` is Hermes Agent's provider-aware resolver. It
-    can reconcile the authenticated Codex catalogue and Hermes' current
-    provider-specific fallback policy. Keep the local table for compatibility
-    with hosts whose resolver is unavailable.
+    Exact proven 900k route names are authoritative. Other Codex routes use
+    Hermes Agent's provider-aware resolver, with the local table retained for
+    compatibility when that resolver is unavailable.
     """
     if not _is_openai_codex_route(provider):
         return None
     bare_model = _bare_model_slug(model)
     if not bare_model:
         return None
+
+    exact_cap = _CODEX_OAUTH_EXACT_CONTEXT_CAPS.get(bare_model)
+    if exact_cap is not None:
+        return exact_cap
 
     try:
         from agent.model_metadata import get_model_context_length
