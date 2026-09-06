@@ -885,7 +885,7 @@ def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
     def transport(**kwargs):
         timeout = float(kwargs["timeout"])
         calls.append(timeout)
-        delay = 0.015
+        delay = 0.15
         if timeout < delay:
             time.sleep(max(0.0, timeout))
             raise TimeoutError("request exceeded remaining budget")
@@ -895,7 +895,7 @@ def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
     provider = VoyageProvider(
         "voyage-test",
         transport=transport,
-        timeout=0.02,
+        timeout=0.2,
         max_batch_items=1,
         sleeper=lambda _delay: None,
     )
@@ -906,7 +906,7 @@ def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
     assert 1 <= len(calls) <= 2
     if len(calls) == 2:
         assert calls[1] < calls[0]
-    assert elapsed < 0.06
+    assert elapsed < 0.5
 
 
 def test_voyage_token_preprocessing_is_inside_absolute_deadline(monkeypatch):
