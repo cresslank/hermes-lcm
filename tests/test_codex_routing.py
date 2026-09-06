@@ -50,7 +50,11 @@ def test_codex_900k_routes_require_exact_provider(provider):
         ("gpt-5.3-codex-spark", 128_000),
     ],
 )
-def test_existing_codex_route_caps_are_preserved(model, expected_cap):
+def test_existing_codex_route_caps_are_preserved(monkeypatch, model, expected_cap):
+    def fail_resolver(*args, **kwargs):
+        raise RuntimeError("provider metadata unavailable")
+
+    _install_model_metadata_resolver(monkeypatch, fail_resolver)
     assert _codex_oauth_context_cap(model, "openai-codex") == expected_cap
 
 
@@ -66,9 +70,14 @@ def test_existing_codex_route_caps_are_preserved(model, expected_cap):
     ],
 )
 def test_900k_suffix_and_malformed_aliases_do_not_gain_900k_cap(
+    monkeypatch,
     model,
     expected_cap,
 ):
+    def fail_resolver(*args, **kwargs):
+        raise RuntimeError("provider metadata unavailable")
+
+    _install_model_metadata_resolver(monkeypatch, fail_resolver)
     assert _codex_oauth_context_cap(model, "openai-codex") == expected_cap
 
 

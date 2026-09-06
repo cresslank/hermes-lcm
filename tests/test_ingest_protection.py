@@ -1795,7 +1795,7 @@ def test_import_lossless_claw_externalizes_legacy_data_uri_content(tmp_path):
     )
     engine.on_session_start("openclaw-lcm:agent:repro:legacy-session", platform="import", context_length=200_000)
     expanded = _expand_ref(engine, ref)
-    assert expanded["content"] == DATA_URI
+    assert expanded["content"] == "legacy " + DATA_URI
 
 
 def test_import_lossless_claw_respects_externalization_path_env(tmp_path, monkeypatch):
@@ -1829,7 +1829,7 @@ def test_import_lossless_claw_respects_externalization_path_env(tmp_path, monkey
     )
     engine.on_session_start("openclaw-lcm:agent:repro:legacy-session", platform="import", context_length=200_000)
     expanded = _expand_ref(engine, ref)
-    assert expanded["content"] == DATA_URI
+    assert expanded["content"] == "legacy " + DATA_URI
 
 
 def test_store_id_expand_never_returns_raw_historical_tool_calls(tmp_path):

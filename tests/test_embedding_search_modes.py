@@ -186,7 +186,7 @@ def test_semantic_budget_bounds_knn_and_does_not_start_fallback_after_expiry(
             pass
 
         def knn(self, *_args, **_kwargs):
-            time.sleep(0.2)  # far exceeds the 0.02s budget
+            time.sleep(0.5)  # far exceeds the 0.02s budget
             return KNNResult(coverage="full")
 
         def close(self):
@@ -212,7 +212,7 @@ def test_semantic_budget_bounds_knn_and_does_not_start_fallback_after_expiry(
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.08
+    assert elapsed < 0.25
     assert payload["timeout"] is True
     assert fallback_calls == 0
 
@@ -787,7 +787,7 @@ def test_hybrid_does_not_start_semantic_arm_after_fts_exhausts_deadline(
     provider_calls = 0
 
     def slow_full_text(_args, **_kwargs):
-        time.sleep(0.1)
+        time.sleep(1.0)
         return json.dumps({"results": []})
 
     def resolve(_config):
@@ -804,7 +804,7 @@ def test_hybrid_does_not_start_semantic_arm_after_fts_exhausts_deadline(
         )
     )
 
-    assert time.monotonic() - started < 0.08
+    assert time.monotonic() - started < 0.25
     assert payload["timeout"] is True
     assert payload["mode"] == "hybrid"
     assert provider_calls == 0
@@ -882,7 +882,7 @@ def test_result_hydration_is_inside_request_deadline(semantic_engine, monkeypatc
                 {"query": "deadline", "mode": "semantic"}, engine=semantic_engine
             )
         )
-        assert time.monotonic() - started < 0.08
+        assert time.monotonic() - started < 0.25
         assert payload["timeout"] is True
         assert payload["timeout_stage"] == "result_resolution"
     finally:

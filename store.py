@@ -1172,10 +1172,11 @@ class MessageStore:
                 # Separate MessageStore instances have separate Python locks.
                 # Acquire SQLite's write reservation before reading so this
                 # read-modify-write serializes across every connection. This is
-                # best-effort telemetry on the completed-compaction hot path, so
-                # permit only a tightly bounded overlap before skipping instead
-                # of inheriting the connection's 30s wait.
-                with _temporary_sqlite_busy_timeout([conn], 100):
+                # Use a 10 ms SQLite busy budget. On macOS's bundled SQLite,
+                # the progressive busy-handler sleeps can turn a nominal 100 ms
+                # PRAGMA into more than 600 ms of wall time, which is too long
+                # for best-effort telemetry on the completed-compaction path.
+                with _temporary_sqlite_busy_timeout([conn], 10):
                     conn.execute("BEGIN IMMEDIATE")
                     row = conn.execute(
                         "SELECT value FROM metadata WHERE key = ?",

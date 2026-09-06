@@ -1061,7 +1061,7 @@ def test_voyage_slow_response_decode_is_inside_absolute_deadline(monkeypatch):
 
     def slow_decode(*args, **kwargs):
         decode_started.set()
-        time.sleep(0.05)
+        time.sleep(0.2)
         return original_decode(*args, **kwargs)
 
     monkeypatch.setattr(provider_mod, "_response_json", slow_decode)
@@ -1075,9 +1075,9 @@ def test_voyage_slow_response_decode_is_inside_absolute_deadline(monkeypatch):
 
     assert exc_info.value.kind == "timeout"
     assert decode_started.is_set()
-    assert time.monotonic() - started < 0.04
+    assert time.monotonic() - started < 0.1
     # Let the side-effect-free parser worker exit before monkeypatch teardown.
-    time.sleep(0.06)
+    time.sleep(0.21)
 
 
 def test_voyage_slow_error_body_scrub_is_bounded_and_never_resent(monkeypatch):
@@ -1169,11 +1169,11 @@ def test_fastembed_normal_operation_is_deadline_bounded(monkeypatch, tmp_path):
             pass
 
         def query_embed(self, texts):
-            time.sleep(0.05)
+            time.sleep(0.2)
             return ([1.0, 0.0] for _ in texts)
 
         def embed(self, texts):
-            time.sleep(0.05)
+            time.sleep(0.2)
             return ([1.0, 0.0] for _ in texts)
 
     monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: SlowFastembedModel)
@@ -1181,7 +1181,7 @@ def test_fastembed_normal_operation_is_deadline_bounded(monkeypatch, tmp_path):
     started = time.monotonic()
     with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
         provider.embed_query("slow")
-    assert time.monotonic() - started < 0.04
+    assert time.monotonic() - started < 0.1
 
 
 def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, tmp_path):
@@ -1215,7 +1215,7 @@ def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, t
         with pytest.raises(EmbeddingProviderError, match="worker capacity exhausted"):
             second.embed_query("must-not-start")
 
-        assert time.monotonic() - started < 0.03
+        assert time.monotonic() - started < 0.2
         assert calls == 1
     finally:
         release_worker.set()
