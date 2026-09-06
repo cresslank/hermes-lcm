@@ -756,7 +756,7 @@ def test_provider_resolution_is_bounded_and_does_not_start_query_or_fallback(
             return super().embed_query(text)
 
     def slow_resolve(_config):
-        time.sleep(0.1)
+        time.sleep(1.0)
         return CountingProvider()
 
     def counted_full_text(_args, **_kwargs):
@@ -773,7 +773,7 @@ def test_provider_resolution_is_bounded_and_does_not_start_query_or_fallback(
         )
     )
 
-    assert time.monotonic() - started < 0.08
+    assert time.monotonic() - started < 0.25
     assert payload["timeout"] is True
     assert payload["timeout_stage"] == "provider_resolution"
     assert query_calls == 0

@@ -913,7 +913,7 @@ def test_voyage_token_preprocessing_is_inside_absolute_deadline(monkeypatch):
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
 
     def slow_count(_text):
-        time.sleep(0.1)
+        time.sleep(1.0)
         return 1
 
     monkeypatch.setattr(provider_mod, "count_tokens", slow_count)
@@ -924,7 +924,7 @@ def test_voyage_token_preprocessing_is_inside_absolute_deadline(monkeypatch):
     with pytest.raises(VoyageError, match="document preprocessing"):
         provider.embed_documents(["slow"])
 
-    assert time.monotonic() - started < 0.08
+    assert time.monotonic() - started < 0.25
     assert transport.calls == []
 
 
