@@ -347,7 +347,10 @@ class _RollupMaintenanceScheduler:
 
 _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
-_SESSION_END_BUSY_TIMEOUT_MS = 50
+# macOS's SQLite busy-handler backoff can turn a nominal 50 ms PRAGMA into
+# roughly 300 ms of wall time. Session-end persistence is best-effort and must
+# not hold the gateway lifecycle path that long.
+_SESSION_END_BUSY_TIMEOUT_MS = 10
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 

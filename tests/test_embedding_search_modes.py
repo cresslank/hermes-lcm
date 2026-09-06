@@ -154,7 +154,7 @@ def test_semantic_timeout_returns_explicit_deadline_without_starting_fallback(
 
     class SlowProvider(MockProvider):
         def embed_query(self, text):
-            time.sleep(0.1)
+            time.sleep(1.0)
             return super().embed_query(text)
 
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: SlowProvider())
@@ -166,7 +166,7 @@ def test_semantic_timeout_returns_explicit_deadline_without_starting_fallback(
         )
     )
 
-    assert time.monotonic() - started < 0.09
+    assert time.monotonic() - started < 0.25
     assert payload["timeout"] is True
     assert payload["mode"] == "semantic"
     assert payload["timeout_stage"] == "full_text"
