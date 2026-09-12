@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +19,8 @@ import hermes_lcm.db_bootstrap as db_bootstrap_module
 import hermes_lcm.maintenance as maintenance_module
 import hermes_lcm.sqlite_util as sqlite_util_module
 from hermes_lcm.maintenance import backup_database, rotate_backup_database
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
 from hermes_lcm.store import MessageStore, build_message_fts_spec
 
 
@@ -74,9 +80,59 @@ def _assert_searchable_store_integrity(store: MessageStore) -> None:
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path):
-    db_path = tmp_path / "database" / "lcm.db"
+def _blocked_sqlite_posix_locks(db_path: Path) -> set[tuple[str, int]]:
+    """Ask another process which SQLite lock bytes this process owns."""
+    targets = [(str(db_path), 1_073_741_824, 510)]
+    shm_path = db_path.with_name(db_path.name + "-shm")
+    if shm_path.exists():
+        targets.extend((str(shm_path), 120 + index, 1) for index in range(8))
+    probe = """
+import errno, fcntl, json, os, sys
+blocked = []
+for index, (path, offset, length) in enumerate(json.loads(sys.argv[1])):
+    fd = os.open(path, os.O_RDWR)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, length, offset, os.SEEK_SET)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            blocked.append(index)
+        else:
+            fcntl.lockf(fd, fcntl.LOCK_UN, length, offset, os.SEEK_SET)
+    finally:
+        os.close(fd)
+print(json.dumps(blocked))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, json.dumps(targets)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    blocked_indexes = json.loads(result.stdout)
+    return {
+        (Path(targets[index][0]).name, targets[index][1])
+        for index in blocked_indexes
+    }
 
+
+def test_message_store_creates_private_database_without_raw_main_open(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "database" / "lcm.db"
+    real_open = os.open
+
+    def reject_published_main_open(path, flags, mode=0o777, *, dir_fd=None):
+        if Path(path).name == db_path.name:
+            raise AssertionError("raw descriptor opened the published SQLite main DB")
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sqlite_util_module.os, "open", reject_published_main_open)
     with _process_umask(0o022):
         store = MessageStore(db_path)
         try:
@@ -166,6 +222,114 @@ def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path)
         existing.close()
 
 
+def test_engine_clones_never_cancel_live_sqlite_posix_locks(tmp_path, monkeypatch):
+    db_path = tmp_path / "lcm.db"
+    config = LCMConfig(database_path=str(db_path))
+    source = LCMEngine(config=config)
+    clones = []
+    connection = source._store.connection
+    assert connection is not None
+    artifact_names = {db_path.name + suffix for suffix in ("", *_SQLITE_SIDECAR_SUFFIXES)}
+    real_open = os.open
+
+    def reject_raw_sqlite_artifact_open(path, flags, mode=0o777, *, dir_fd=None):
+        if Path(path).name in artifact_names:
+            raise AssertionError(f"production raw-opened SQLite artifact: {path}")
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    try:
+        source._store.append("lock-owner", {"role": "user", "content": "lock sentinel"})
+        source._store.commit()
+        connection.execute("BEGIN")
+        connection.execute("SELECT COUNT(*) FROM messages").fetchone()
+        held_locks = _blocked_sqlite_posix_locks(db_path)
+        assert held_locks, "SQLite connection did not expose a POSIX lock to the probe"
+
+        monkeypatch.setattr(sqlite_util_module.os, "open", reject_raw_sqlite_artifact_open)
+        for index in range(8):
+            for artifact in _sqlite_artifacts(db_path):
+                if artifact.exists():
+                    artifact.chmod(0o644)
+            clone = (
+                source.clone_for_agent()
+                if index % 2
+                else LCMEngine(config=LCMConfig(database_path=str(db_path)))
+            )
+            clones.append(clone)
+            assert held_locks <= _blocked_sqlite_posix_locks(db_path)
+            _assert_private_sqlite_artifacts(db_path)
+    finally:
+        connection.rollback()
+        for clone in reversed(clones):
+            clone.shutdown()
+        source.shutdown()
+
+
+def test_concurrent_clones_preserve_sidecar_generation_and_integrity(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    source = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    sidecars = [
+        db_path.with_name(db_path.name + suffix)
+        for suffix in ("-wal", "-shm")
+    ]
+    expected_generation = {
+        sidecar.name: (sidecar.stat().st_dev, sidecar.stat().st_ino)
+        for sidecar in sidecars
+    }
+    errors: list[BaseException] = []
+    error_lock = threading.Lock()
+    start = threading.Barrier(6)
+
+    def exercise_clones(worker: int) -> None:
+        try:
+            start.wait(timeout=30)
+            for iteration in range(5):
+                clone = source.clone_for_agent()
+                try:
+                    clone._store.append(
+                        f"worker-{worker}",
+                        {
+                            "role": "user",
+                            "content": f"concurrent write {worker}:{iteration}",
+                        },
+                    )
+                    clone._store.commit()
+                    current = {
+                        sidecar.name: (sidecar.stat().st_dev, sidecar.stat().st_ino)
+                        for sidecar in sidecars
+                    }
+                    assert current == expected_generation
+                finally:
+                    clone.shutdown()
+        except BaseException as exc:
+            with error_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=exercise_clones, args=(index,)) for index in range(6)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        assert not [thread for thread in threads if thread.is_alive()]
+        assert not errors
+        assert {
+            sidecar.name: (sidecar.stat().st_dev, sidecar.stat().st_ino)
+            for sidecar in sidecars
+        } == expected_generation
+        connection = source._store.connection
+        assert connection is not None
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE content LIKE 'concurrent write %'"
+        ).fetchone()[0] == 30
+    finally:
+        source.shutdown()
+
+
 @pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
 def test_message_store_refuses_symlinked_sidecar_before_chmod(tmp_path, suffix):
     db_path = tmp_path / "lcm.db"
@@ -195,7 +359,7 @@ def test_message_store_refuses_hardlinked_sidecar_before_chmod(tmp_path, suffix)
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
-def test_message_store_refuses_sidecar_link_swap_before_chmod(
+def test_message_store_refuses_sidecar_link_swap_before_identity_revalidation(
     tmp_path,
     monkeypatch,
     link_kind,
@@ -206,23 +370,31 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
     target = tmp_path / "unrelated.txt"
     target.write_text("shared", encoding="utf-8")
     target.chmod(0o644)
-    real_open = os.open
+    displaced = tmp_path / "displaced-sidecar"
+    real_chmod = os.chmod
     swapped = False
 
-    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+    def swapping_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
         nonlocal swapped
+        if dir_fd is None:
+            result = real_chmod(path, mode, follow_symlinks=follow_symlinks)
+        else:
+            result = real_chmod(
+                path,
+                mode,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
         if not swapped and dir_fd is not None and path == sidecar.name:
             swapped = True
-            sidecar.unlink()
+            sidecar.rename(displaced)
             if link_kind == "symlink":
                 sidecar.symlink_to(target)
             else:
                 os.link(target, sidecar)
-        if dir_fd is None:
-            return real_open(path, flags, mode)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
+        return result
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", swapping_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", swapping_chmod)
 
     with pytest.raises(OSError):
         MessageStore(db_path)
@@ -231,7 +403,7 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
     assert _mode(target) == 0o644
 
 
-def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
+def test_message_store_refuses_sidecar_replacement_after_pathname_chmod(
     tmp_path,
     monkeypatch,
 ):
@@ -242,30 +414,37 @@ def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
     replacement.write_bytes(b"unrelated")
     sidecar.chmod(0o644)
     replacement.chmod(0o644)
-    real_open = os.open
+    displaced = tmp_path / "displaced-journal"
+    real_chmod = os.chmod
     swapped = False
 
-    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+    def swapping_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
         nonlocal swapped
         if dir_fd is None:
-            return real_open(path, flags, mode)
-        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            result = real_chmod(path, mode, follow_symlinks=follow_symlinks)
+        else:
+            result = real_chmod(
+                path,
+                mode,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
         if not swapped and dir_fd is not None and path == sidecar.name:
             swapped = True
-            sidecar.unlink()
+            sidecar.rename(displaced)
             replacement.rename(sidecar)
-        return fd
+        return result
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", swapping_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", swapping_chmod)
 
-    with pytest.raises(OSError, match="directory entry changed while opening"):
+    with pytest.raises(OSError, match="directory entry changed while restricting permissions"):
         MessageStore(db_path)
 
     assert swapped is True
     assert _mode(sidecar) == 0o644
 
 
-def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
+def test_message_store_tolerates_sidecar_disappearing_before_pathname_chmod(
     tmp_path,
     monkeypatch,
 ):
@@ -273,19 +452,24 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
-    real_open = os.open
+    real_chmod = os.chmod
     disappeared = False
 
-    def disappearing_open(path, flags, mode=0o777, *, dir_fd=None):
+    def disappearing_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
         nonlocal disappeared
         if not disappeared and dir_fd is not None and path == journal.name:
             disappeared = True
             journal.unlink()
         if dir_fd is None:
-            return real_open(path, flags, mode)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
+            return real_chmod(path, mode, follow_symlinks=follow_symlinks)
+        return real_chmod(
+            path,
+            mode,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", disappearing_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", disappearing_chmod)
 
     store = MessageStore(db_path)
     try:
@@ -295,7 +479,7 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
         store.close()
 
 
-def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
+def test_message_store_tolerates_sidecar_unlinked_after_pathname_chmod(
     tmp_path,
     monkeypatch,
 ):
@@ -303,20 +487,26 @@ def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
-    real_open = os.open
+    real_chmod = os.chmod
     unlinked = False
 
-    def unlinking_open(path, flags, mode=0o777, *, dir_fd=None):
+    def unlinking_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
         nonlocal unlinked
         if dir_fd is None:
-            return real_open(path, flags, mode)
-        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            result = real_chmod(path, mode, follow_symlinks=follow_symlinks)
+        else:
+            result = real_chmod(
+                path,
+                mode,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
         if not unlinked and path == journal.name:
             unlinked = True
             journal.unlink()
-        return fd
+        return result
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", unlinking_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", unlinking_chmod)
 
     store = MessageStore(db_path)
     try:

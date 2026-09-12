@@ -13,6 +13,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -531,6 +532,18 @@ def _db_text_dump(db_path: Path) -> str:
     return "\n".join(parts)
 
 
+def _db_snapshot_bytes(store: Any) -> bytes:
+    """Read physical DB bytes from a closed snapshot, never the live inode."""
+    with tempfile.TemporaryDirectory(prefix="hermes-lcm-stress-") as directory:
+        snapshot_path = Path(directory) / "snapshot.sqlite3"
+        destination = sqlite3.connect(snapshot_path)
+        try:
+            store.backup(destination)
+        finally:
+            destination.close()
+        return snapshot_path.read_bytes()
+
+
 def _no_orphan_tool_results(messages: list[dict[str, Any]]) -> tuple[bool, list[str]]:
     calls: set[str] = set()
     result_ids: list[str] = []
@@ -660,7 +673,7 @@ def _case_redaction_and_externalization_boundaries(run: StressRun) -> None:
         db_path = Path(engine._store.db_path)
         dump = _db_text_dump(db_path)
         try:
-            db_file_bytes = db_path.read_bytes()
+            db_file_bytes = _db_snapshot_bytes(engine._store)
         except Exception:
             db_file_bytes = b""
         leaked: list[dict[str, str]] = []
