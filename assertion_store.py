@@ -215,9 +215,16 @@ def _bounded_probability(value: float | None, field: str) -> float | None:
 class AssertionStore:
     """SQLite assertion store bound to the same physical DB as ``MessageStore``."""
 
-    def __init__(self, db_path: str | Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        read_only: bool = False,
+        journal_mode: str | None = None,
+    ):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
+        self.journal_mode = journal_mode
         self._write_lock = threading.RLock()
         self._conn = self._open_connection()
         try:
@@ -248,7 +255,7 @@ class AssertionStore:
                 isolation_level=None,
             )
             refuse_schema_version_too_new(conn)
-            configure_connection(conn)
+            configure_connection(conn, journal_mode=self.journal_mode)
         conn.row_factory = sqlite3.Row
         return conn
 

@@ -26,6 +26,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 from .config import LCMConfig
 from .db_bootstrap import (
+    checkpoint_wal_on_close,
     configure_connection,
     ensure_chunk_tables,
     ensure_embedding_tables,
@@ -315,6 +316,7 @@ class VectorStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         resolved_config = config or LCMConfig.from_env()
+        self.journal_mode = resolved_config.sqlite_journal_mode
         self.bounded_scan_rows = (
             resolved_config.embedding_bounded_scan_rows
             if bounded_scan_rows is None
@@ -380,7 +382,7 @@ class VectorStore:
             isolation_level=None,
         )
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
+        configure_connection(self._conn, journal_mode=self.journal_mode)
         self._conn.row_factory = sqlite3.Row
         run_versioned_migrations(self._conn)
         self._ensure_embedding_schema()
@@ -2944,10 +2946,7 @@ class VectorStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
+            checkpoint_wal_on_close(conn)
             conn.close()
             self._conn = None
         with self._cache_lock:

@@ -18,9 +18,13 @@ from pathlib import Path
 import pytest
 
 from hermes_lcm.db_bootstrap import (
+    SQLiteJournalModeError,
     configure_connection,
     ensure_message_origin_columns,
+    join_background_integrity_scans,
 )
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.lifecycle_state import LifecycleStateStore
@@ -83,6 +87,62 @@ class TestConfigureConnectionPragmas:
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
         assert val == 268_435_456, f"expected mmap_size=268435456, got {val}"
+
+    def test_delete_mode_uses_full_sync_without_mmap_or_wal_pragmas(
+        self, db_path: Path
+    ):
+        conn = sqlite3.connect(str(db_path))
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        configure_connection(conn, journal_mode="delete")
+
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+        assert conn.execute("PRAGMA mmap_size").fetchone()[0] == 0
+        conn.close()
+
+        configured = [statement.lower() for statement in statements]
+        assert not any("wal_autocheckpoint" in statement for statement in configured)
+        assert not any("wal_checkpoint" in statement for statement in configured)
+
+    def test_delete_mode_refuses_live_wal_database(self, db_path: Path):
+        holder = sqlite3.connect(str(db_path), isolation_level=None)
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("CREATE TABLE held(value TEXT)")
+        holder.execute("BEGIN")
+        holder.execute("SELECT * FROM held").fetchall()
+
+        contender = sqlite3.connect(str(db_path), timeout=0.05)
+        try:
+            with pytest.raises(SQLiteJournalModeError, match="Stop every process"):
+                configure_connection(contender, journal_mode="delete")
+            assert contender.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        finally:
+            contender.close()
+            holder.rollback()
+            holder.close()
+
+    def test_journal_mode_config_is_validated_and_yaml_aware(
+        self, monkeypatch, tmp_path: Path
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  sqlite_journal_mode: delete\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SQLITE_JOURNAL_MODE", raising=False)
+
+        config = LCMConfig.from_env()
+        assert config.sqlite_journal_mode == "delete"
+        assert config.config_sources["sqlite_journal_mode"] == (
+            "config_yaml:lcm.sqlite_journal_mode"
+        )
+        assert "sqlite_journal_mode" not in config.ignored_config_yaml_lcm_keys
+
+        monkeypatch.setenv("LCM_SQLITE_JOURNAL_MODE", "truncate")
+        with pytest.raises(ValueError, match="LCM_SQLITE_JOURNAL_MODE"):
+            LCMConfig.from_env()
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +238,70 @@ class TestGracefulClose:
         lc = LifecycleStateStore(db)
         lc._conn = None
         lc.close()  # should not raise
+
+    def test_delete_mode_close_does_not_issue_wal_checkpoint(
+        self, monkeypatch, tmp_path: Path
+    ):
+        monkeypatch.setenv("LCM_SQLITE_JOURNAL_MODE", "delete")
+        store = MessageStore(tmp_path / "delete-close.db")
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        store.close()
+        assert not any(
+            "wal_checkpoint" in statement.lower() for statement in statements
+        )
+
+
+def test_delete_mode_cloned_engines_write_and_close_concurrently(tmp_path: Path):
+    db_path = tmp_path / "shared-delete.db"
+    config = LCMConfig(database_path=str(db_path), sqlite_journal_mode="delete")
+    prototype = LCMEngine(config=config, hermes_home=str(tmp_path))
+    clones = [prototype.clone_for_agent() for _ in range(4)]
+    join_background_integrity_scans(timeout=30.0)
+
+    barrier = threading.Barrier(len(clones))
+    errors: list[BaseException] = []
+    error_lock = threading.Lock()
+
+    def write_and_close(index: int, engine: LCMEngine) -> None:
+        try:
+            engine.on_session_start(
+                f"delete-session-{index}", context_length=100_000
+            )
+            barrier.wait(timeout=30.0)
+            engine.ingest(
+                [{"role": "user", "content": f"delete writer {index}"}]
+            )
+        except BaseException as exc:  # noqa: BLE001 - re-asserted below
+            with error_lock:
+                errors.append(exc)
+        finally:
+            engine.shutdown()
+
+    threads = [
+        threading.Thread(target=write_and_close, args=(index, engine))
+        for index, engine in enumerate(clones)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60.0)
+    prototype.shutdown()
+    join_background_integrity_scans(timeout=30.0)
+
+    assert not [thread for thread in threads if thread.is_alive()]
+    assert not errors
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+    check = sqlite3.connect(str(db_path))
+    try:
+        assert check.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert check.execute("SELECT count(*) FROM messages").fetchone()[0] == 4
+    finally:
+        check.close()
 
 
 # --------------------------------------------------------------------------- #

@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
+    checkpoint_wal_on_close,
     configure_connection,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
@@ -161,8 +162,9 @@ class SummaryDAG:
 
     DELETE_SESSION_SCOPE_TABLE = _DELETE_SESSION_SCOPE_TABLE
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, journal_mode: str | None = None):
         self.db_path = Path(db_path)
+        self.journal_mode = journal_mode
         self._conn: Optional[sqlite3.Connection] = None
         self._db_lock = threading.RLock()
         self._init_db()
@@ -182,7 +184,7 @@ class SummaryDAG:
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
+        configure_connection(self._conn, journal_mode=self.journal_mode)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS summary_nodes (
                 node_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -877,10 +879,7 @@ class SummaryDAG:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
+            checkpoint_wal_on_close(conn)
             conn.close()
             self._conn = None
 

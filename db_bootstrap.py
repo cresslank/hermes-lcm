@@ -31,6 +31,10 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
+class SQLiteJournalModeError(RuntimeError):
+    """Raised when SQLite cannot safely enter the configured journal mode."""
+
+
 # The core schema ladder stops at 5. Optional embedding tables are NOT part of
 # this counter: they are created lazily+idempotently by VectorStore on first use
 # (see ``ensure_embedding_tables`` / ``VectorStore._ensure_embedding_schema``) and
@@ -95,44 +99,84 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
     return False
 
 
-def configure_connection(conn: sqlite3.Connection) -> None:
-    """Configure SQLite connection for WAL durability and hygiene.
+def configure_connection(
+    conn: sqlite3.Connection,
+    *,
+    journal_mode: str | None = None,
+) -> None:
+    """Configure SQLite for the validated WAL or DELETE operating policy.
 
-    In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
-    every process opens its own sqlite3.Connection pointing at the same
-    lcm.db file.  These settings improve committed-write durability and WAL
-    hygiene, but do NOT make sibling processes safe from an unexpected process
-    death.  Abnormal exit still depends on normal SQLite WAL recovery;
-    application-level checkpoints only run during graceful shutdown (see
-    ``MessageStore.close()`` etc.).
-
-    Key design decisions:
-    - journal_mode=WAL  : writes go to a separate log; readers never block.
-    - synchronous=FULL  : fsync both the WAL and the WAL index before every
-                          write transaction commit.  WAL + FULL is the only
-                          combination SQLite guarantees survives power loss
-                          without data loss (NORMAL may lose the WAL index).
-    - wal_autocheckpoint=500 : after 500 WAL pages (~2 MB) SQLite will try
-                               an automatic passive checkpoint.  This is a
-                               best-effort hint — it is silently skipped when
-                               another connection holds a read transaction.
-                               Under checkpoint starvation WAL can grow well
-                               beyond this trigger.
-    - journal_size_limit=67108864 (64 MiB) : limits the WAL file size after
-                                             a successful checkpoint or reset.
-                                             It does NOT force a checkpoint
-                                             or cap growth while another
-                                             connection holds an old WAL
-                                             end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    WAL remains the compatibility default. Operators may select rollback-journal
+    DELETE mode as a quarantine after completing the documented zero-holder
+    offline conversion. DELETE keeps ``synchronous=FULL``, disables data-file
+    mmap, and does not configure WAL checkpoint behavior.
     """
+    from .config import resolve_sqlite_journal_mode, validate_sqlite_journal_mode
+
+    mode = (
+        resolve_sqlite_journal_mode()
+        if journal_mode is None
+        else validate_sqlite_journal_mode(journal_mode, source="journal_mode")
+    )
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    if mode == "delete":
+        _execute_delete_conversion(conn)
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA mmap_size=0")
+        return
+
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
+
+
+def _journal_mode(conn: sqlite3.Connection) -> str:
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    return str(row[0]).lower() if row else ""
+
+
+def _execute_delete_conversion(conn: sqlite3.Connection) -> None:
+    """Enter DELETE mode, refusing an unsafe/live WAL transition clearly."""
+    current = _journal_mode(conn)
+    if current in {"delete", "memory"}:
+        return
+    try:
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+    except sqlite3.Error as exc:
+        raise SQLiteJournalModeError(
+            "LCM is configured for SQLite journal_mode=DELETE, but the database "
+            f"is still in {current or 'an unknown'} mode and could not be converted. "
+            "Stop every process holding the database, checkpoint and convert it "
+            "offline, then restart LCM."
+        ) from exc
+    effective = str(row[0]).lower() if row else _journal_mode(conn)
+    if effective != "delete":
+        raise SQLiteJournalModeError(
+            "LCM is configured for SQLite journal_mode=DELETE, but SQLite kept "
+            f"the database in {effective or current or 'an unknown'} mode. Stop "
+            "every process holding the database, checkpoint and convert it "
+            "offline, then restart LCM."
+        )
+
+
+def checkpoint_wal_on_close(conn: sqlite3.Connection) -> None:
+    """Best-effort passive checkpoint, but only for an actual WAL connection."""
+    try:
+        if _journal_mode(conn) == "wal":
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except sqlite3.Error:
+        pass
+
+
+def _configure_reopened_connection(conn: sqlite3.Connection) -> None:
+    """Configure an internal helper to match the database's established mode."""
+    current = _journal_mode(conn)
+    configure_connection(
+        conn,
+        journal_mode=current if current in {"wal", "delete"} else None,
+    )
 
 
 def _execute_wal_conversion_with_lock_retry(
@@ -2667,7 +2711,7 @@ def _run_background_integrity_scan(
     try:
         scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
-            scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            _configure_reopened_connection(scan_conn)
             # Persist the scan-started stamp on this DB so a crash mid-scan is
             # detectable cross-process via the staleness window above.
             _record_scan_started(scan_conn, spec, now=started_at)
@@ -2678,7 +2722,7 @@ def _run_background_integrity_scan(
 
         meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
-            meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            _configure_reopened_connection(meta_conn)
             status = result.get("status")
             if status == "pass":
                 _record_integrity_checked(meta_conn, spec, now=started_at)
@@ -2706,6 +2750,7 @@ def _run_background_integrity_scan(
         try:
             cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
             try:
+                _configure_reopened_connection(cleanup)
                 _clear_scan_started(cleanup, spec, expected=started_at)
                 cleanup.commit()
             finally:
@@ -2756,7 +2801,7 @@ def _dispatch_background_integrity_scan(
                 db_path, timeout=claim_timeout, check_same_thread=False
             )
             try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                _configure_reopened_connection(claim_conn)
                 claim_conn.execute("BEGIN IMMEDIATE")
                 _record_scan_started(claim_conn, spec, now=current)
                 claim_conn.commit()
