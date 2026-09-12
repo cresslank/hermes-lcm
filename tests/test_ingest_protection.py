@@ -2811,6 +2811,120 @@ def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_example
     assert detail["missing_externalized_payload_refs"] == []
 
 
+def test_externalized_payload_integrity_scan_ignores_code_search_placeholder_examples(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    for ref in ("raw.json", "live-ingest.json", "live-recall.json"):
+        (storage_dir / ref).write_text(json.dumps({"content": "scrubbed payload"}))
+
+    # Mirrors the persisted structure of a code-search tool result. The source
+    # snippets are scrubbed, but retain the JSON nesting, line-number prefixes,
+    # quoting, commas, and placeholder forms that triggered the production scan.
+    code_search_result = json.dumps(
+        {
+            "total_count": 3,
+            "matches_format": (
+                "path-grouped: each file path on its own line, followed by indented "
+                "'<line>: <content>' rows for matches in that file"
+            ),
+            "matches_text": "\n".join(
+                [
+                    "tests/test_scrubbed.py",
+                    '  101:         "[Externalized payload: kind=raw_payload; role=assistant; chars=1200; bytes=1200; ref=raw.json]",',
+                    '  202:             "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=missing-raw.json]",',
+                    '  303:             "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=missing-doctor.json]",',
+                ]
+            ),
+        }
+    )
+    recalled_code_search_result = json.dumps(
+        {
+            "store_id": 44578,
+            "source_type": "raw_message",
+            "session_id": "scrubbed-session",
+            "source": "subagent",
+            "conversation_id": "scrubbed-conversation",
+            "role": "tool",
+            "timestamp": 1.0,
+            "tool_call_id": "scrubbed-call",
+            "from_current_session": False,
+            "content": code_search_result,
+            "content_chars": len(code_search_result),
+            "content_offset": 0,
+            "content_returned_chars": len(code_search_result),
+            "content_truncated": False,
+            "next_content_offset": 0,
+            "has_more": False,
+            # These are derived hints from the recalled source, not owning refs.
+            "externalized_refs": ["raw.json"],
+            "externalized_ref": "raw.json",
+            "externalized_note": "scrubbed cross-session traceability note",
+        }
+    )
+    live_recall_placeholder = (
+        "[Externalized tool output: tool_call_id=call_1; chars=1; bytes=1; "
+        "ref=live-recall.json]"
+    )
+    recalled_payload_result = json.dumps(
+        {
+            "store_id": 77,
+            "source_type": "raw_message",
+            "role": "assistant",
+            "content": live_recall_placeholder,
+            "externalized_refs": ["live-recall.json"],
+            "externalized_ref": "live-recall.json",
+        }
+    )
+    rows = [
+        ("tool", "search_files", code_search_result),
+        ("tool", "lcm_expand", recalled_code_search_result),
+        ("tool", "lcm_expand", recalled_payload_result),
+        (
+            "assistant",
+            None,
+            "[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
+            "chars=1; bytes=1; ref=live-ingest.json]",
+        ),
+    ]
+    engine._store._conn.executemany(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                engine.current_session_id,
+                "subagent",
+                role,
+                content,
+                None,
+                None,
+                tool_name,
+                float(index),
+                1,
+                0,
+            )
+            for index, (role, tool_name, content) in enumerate(rows, start=1)
+        ],
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 2
+    assert detail["externalized_payload_refs_existing"] == 2
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+    assert detail["externalized_payload_files_unreferenced"] == 1
+    assert detail["unreferenced_externalized_payload_files"] == [
+        {"externalized_ref": "raw.json"}
+    ]
+
+
 def test_lcm_doctor_warns_on_missing_externalized_payload_refs_when_inline_payloads_are_clean(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()

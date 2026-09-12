@@ -1695,7 +1695,51 @@ def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spa
     return refs
 
 
-def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) -> list[str]:
+def _is_code_search_result(value: Any) -> bool:
+    """Return True only for the structured result emitted by ``search_files``.
+
+    Placeholder-shaped text in ``matches_text`` is source-code evidence, not a
+    reference from the message that stores the tool result. Keep this structural
+    check deliberately exact so ordinary JSON tool results continue to be
+    scanned for externalized payload refs.
+    """
+    if not isinstance(value, dict) or set(value) != {
+        "total_count",
+        "matches_format",
+        "matches_text",
+    }:
+        return False
+    matches_format = value.get("matches_format")
+    return (
+        isinstance(value.get("total_count"), int)
+        and not isinstance(value.get("total_count"), bool)
+        and isinstance(matches_format, str)
+        and matches_format.startswith("path-grouped:")
+        and "<line>: <content>" in matches_format
+        and isinstance(value.get("matches_text"), str)
+    )
+
+
+def _is_lcm_expand_result(value: Any) -> bool:
+    """Return True for a structured raw-message result from ``lcm_expand``."""
+    return (
+        isinstance(value, dict)
+        and value.get("source_type") == "raw_message"
+        and isinstance(value.get("store_id"), int)
+        and not isinstance(value.get("store_id"), bool)
+        and isinstance(value.get("role"), str)
+        and isinstance(value.get("content"), str)
+        and isinstance(value.get("externalized_refs", []), list)
+    )
+
+
+def _refs_for_externalized_integrity_scan(
+    value: str,
+    *,
+    role: str,
+    field: str,
+    tool_name: str = "",
+) -> list[str]:
     """Return refs that plausibly came from LCM storage-boundary placeholders.
 
     Tool outputs and tool-call arguments often contain escaped code snippets,
@@ -1745,8 +1789,31 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                 _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
     if role == "tool":
-        refs = _extract_unescaped_externalized_payload_refs(value)
         parsed = _maybe_parse_json_string(value)
+        if (
+            field == "content"
+            and tool_name == "search_files"
+            and _is_code_search_result(parsed)
+        ):
+            return []
+        if (
+            field == "content"
+            and tool_name == "lcm_expand"
+            and _is_lcm_expand_result(parsed)
+        ):
+            assert isinstance(parsed, dict)
+            expanded_content = parsed["content"]
+            expanded_role = parsed["role"]
+            if expanded_role == "tool" and _is_code_search_result(
+                _maybe_parse_json_string(expanded_content)
+            ):
+                return []
+            return _refs_for_externalized_integrity_scan(
+                expanded_content,
+                role=expanded_role,
+                field="content",
+            )
+        refs = _extract_unescaped_externalized_payload_refs(value)
         if parsed is not None:
             for nested in _walk_string_values(parsed):
                 nested_stripped = nested.strip()
@@ -1773,9 +1840,9 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
 
     referenced_refs: set[str] = set()
     first_location_by_ref: dict[str, dict[str, Any]] = {}
-    for store_id, session_id, source, role, content, tool_calls in conn.execute(
+    for store_id, session_id, source, role, tool_name, content, tool_calls in conn.execute(
         """
-        SELECT store_id, session_id, source, role, content, tool_calls
+        SELECT store_id, session_id, source, role, tool_name, content, tool_calls
         FROM messages
         WHERE COALESCE(content, '') LIKE '%ref=%]%'
            OR COALESCE(tool_calls, '') LIKE '%ref=%]%'
@@ -1785,7 +1852,12 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         for field, value in (("content", content), ("tool_calls", tool_calls)):
             if not isinstance(value, str):
                 continue
-            for ref in _refs_for_externalized_integrity_scan(value, role=str(role or ""), field=field):
+            for ref in _refs_for_externalized_integrity_scan(
+                value,
+                role=str(role or ""),
+                field=field,
+                tool_name=str(tool_name or ""),
+            ):
                 referenced_refs.add(ref)
                 first_location_by_ref.setdefault(
                     ref,
