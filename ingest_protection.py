@@ -1695,6 +1695,119 @@ def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spa
     return refs
 
 
+def _is_quoted_source_literal_match(text: str, match: re.Match[str]) -> bool:
+    """Return True when a placeholder match is directly quoted as source text."""
+    if match.start() <= 0 or match.end() >= len(text):
+        return False
+    quote = text[match.start() - 1]
+    return quote in ('"', "'") and text[match.end()] == quote
+
+
+def _extract_source_text_externalized_payload_refs(
+    text: str,
+    *,
+    require_numbered_line: bool = False,
+) -> list[str]:
+    """Scan source-like text while excluding directly quoted placeholder literals.
+
+    Exact and embedded unquoted placeholders remain owning references.  For
+    terminal output, suppression is additionally limited to numbered source
+    lines, so ordinary command output remains fail-closed.
+    """
+    refs: list[str] = []
+    for line in text.splitlines() or [text]:
+        numbered_source_line = re.match(r"^\s*\d+:\s+", line) is not None
+        for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
+            for match in pattern.finditer(line):
+                ref = match.group(1).strip()
+                if not _is_basename_ref(ref):
+                    continue
+                if (
+                    (not require_numbered_line or numbered_source_line)
+                    and _is_quoted_source_literal_match(line, match)
+                ):
+                    continue
+                if ref not in refs:
+                    refs.append(ref)
+    return refs
+
+
+def _refs_from_terminal_source_listing(value: Any) -> list[str] | None:
+    """Return refs for an exact terminal result shape, or None when uncertain."""
+    if not isinstance(value, dict):
+        return None
+    required = {"output", "exit_code", "error"}
+    allowed = required | {"approval"}
+    if not required.issubset(value) or not set(value).issubset(allowed):
+        return None
+    if not isinstance(value["output"], str):
+        return None
+    if not isinstance(value["exit_code"], int) or isinstance(value["exit_code"], bool):
+        return None
+    if value["error"] is not None and not isinstance(value["error"], str):
+        return None
+    if "approval" in value and not isinstance(value["approval"], str):
+        return None
+
+    refs = _extract_source_text_externalized_payload_refs(
+        value["output"],
+        require_numbered_line=True,
+    )
+    for key in ("error", "approval"):
+        nested = value.get(key)
+        if isinstance(nested, str):
+            _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
+    return refs
+
+
+def _refs_from_single_patch_tool_call(value: Any) -> list[str] | None:
+    """Exclude quoted source literals from one exact ``patch`` replace call.
+
+    Returning None deliberately falls back to the generic fail-closed scanner
+    for mixed calls, provider extensions, malformed JSON, or unknown schemas.
+    """
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        return None
+    call = value[0]
+    allowed_call_keys = {"id", "call_id", "response_item_id", "type", "function"}
+    if (
+        not {"type", "function"}.issubset(call)
+        or not set(call).issubset(allowed_call_keys)
+        or call.get("type") != "function"
+    ):
+        return None
+    if any(
+        key in call and call[key] is not None and not isinstance(call[key], str)
+        for key in ("id", "call_id", "response_item_id")
+    ):
+        return None
+    function = call.get("function")
+    if not isinstance(function, dict) or set(function) != {"name", "arguments"}:
+        return None
+    if function.get("name") != "patch" or not isinstance(function.get("arguments"), str):
+        return None
+    arguments = _maybe_parse_json_string(function["arguments"])
+    if not isinstance(arguments, dict) or set(arguments) != {
+        "mode",
+        "path",
+        "old_string",
+        "new_string",
+    }:
+        return None
+    if arguments.get("mode") != "replace" or not all(
+        isinstance(arguments.get(key), str) for key in ("path", "old_string", "new_string")
+    ):
+        return None
+
+    refs: list[str] = []
+    for key in ("old_string", "new_string"):
+        _append_unique_refs(
+            refs,
+            _extract_source_text_externalized_payload_refs(arguments[key]),
+        )
+    return refs
+
+
 def _is_code_search_result(value: Any) -> bool:
     """Return True only for the structured result emitted by ``search_files``.
 
@@ -1756,8 +1869,11 @@ def _refs_for_externalized_integrity_scan(
     if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
         return extract_all_externalized_payload_refs(stripped)
     if field == "tool_calls":
-        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
         parsed = _maybe_parse_json_string(value)
+        patch_refs = _refs_from_single_patch_tool_call(parsed)
+        if patch_refs is not None:
+            return patch_refs
+        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
         if parsed is None:
             return refs
         for argument in _walk_tool_call_argument_values(parsed):
@@ -1790,6 +1906,10 @@ def _refs_for_externalized_integrity_scan(
         return refs
     if role == "tool":
         parsed = _maybe_parse_json_string(value)
+        if field == "content" and tool_name == "terminal":
+            terminal_refs = _refs_from_terminal_source_listing(parsed)
+            if terminal_refs is not None:
+                return terminal_refs
         if (
             field == "content"
             and tool_name == "search_files"

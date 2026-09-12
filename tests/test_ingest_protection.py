@@ -2811,6 +2811,340 @@ def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_example
     assert detail["missing_externalized_payload_refs"] == []
 
 
+def test_externalized_payload_integrity_scan_ignores_numbered_source_examples_in_terminal_json(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    numbered_source = "\n".join(
+        [
+            "tests/test_scrubbed.py",
+            '401:         "[Externalized payload: kind=raw_payload; role=assistant; chars=1200; bytes=1200; ref=fixture-raw.json]",',
+            '  419:             "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=fixture-missing-raw.json]",',
+            '  2013:             "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=fixture-missing-doctor.json]",',
+        ]
+    )
+    terminal_result = json.dumps(
+        {
+            "output": numbered_source,
+            "exit_code": 0,
+            "error": None,
+            "approval": "scrubbed approval metadata",
+        }
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "subagent",
+            "tool",
+            terminal_result,
+            None,
+            None,
+            "terminal",
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
+def test_externalized_payload_integrity_scan_ignores_nested_escaped_source_examples_in_patch_arguments(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    replacement_source = "\n".join(
+        [
+            "def test_scrubbed_fixture():",
+            '    row = "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=1; bytes=1; ref=fixture-live-ingest.json]"',
+            '    assert row != "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=fixture-missing-raw.json]"',
+        ]
+    )
+    arguments = json.dumps(
+        {
+            "mode": "replace",
+            "path": "/scrubbed/tests/test_ingest_protection.py",
+            "old_string": "def test_scrubbed_fixture():\n",
+            "new_string": replacement_source,
+        }
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "id": "scrubbed-call",
+                "call_id": "scrubbed-call",
+                "response_item_id": "scrubbed-response",
+                "type": "function",
+                "function": {"name": "patch", "arguments": arguments},
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "subagent",
+            "assistant",
+            "",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
+def test_externalized_payload_integrity_scan_preserves_missing_ingest_and_recalled_refs(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    ingest_placeholder = (
+        "[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
+        "chars=1; bytes=1; ref=missing-ingest-owner.json]"
+    )
+    recalled_placeholder = (
+        "[Externalized tool output: tool_call_id=call_1; chars=1; bytes=1; "
+        "ref=missing-recalled-owner.json]"
+    )
+    recalled_result = json.dumps(
+        {
+            "store_id": 77,
+            "source_type": "raw_message",
+            "role": "assistant",
+            "content": recalled_placeholder,
+            "externalized_refs": ["missing-recalled-owner.json"],
+        }
+    )
+    engine._store._conn.executemany(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                engine.current_session_id,
+                "subagent",
+                "assistant",
+                ingest_placeholder,
+                None,
+                None,
+                None,
+                1.0,
+                1,
+                0,
+            ),
+            (
+                engine.current_session_id,
+                "subagent",
+                "tool",
+                recalled_result,
+                None,
+                None,
+                "lcm_expand",
+                2.0,
+                1,
+                0,
+            ),
+        ],
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 2
+    assert detail["externalized_payload_refs_missing"] == 2
+    assert {
+        row["externalized_ref"] for row in detail["missing_externalized_payload_refs"]
+    } == {"missing-ingest-owner.json", "missing-recalled-owner.json"}
+
+
+def test_externalized_payload_integrity_scan_preserves_owning_refs_in_recognized_source_containers(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    terminal_owner = (
+        "[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
+        "chars=1; bytes=1; ref=missing-terminal-owner.json]"
+    )
+    patch_owner = (
+        "[Externalized LCM ingest payload: kind=ingest_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=missing-patch-owner.json]"
+    )
+    terminal_result = json.dumps(
+        {"output": f"ordinary command output: {terminal_owner}", "exit_code": 0, "error": None}
+    )
+    patch_arguments = json.dumps(
+        {
+            "mode": "replace",
+            "path": "/scrubbed/module.py",
+            "old_string": "old source",
+            "new_string": patch_owner,
+        }
+    )
+    patch_tool_calls = json.dumps(
+        [
+            {
+                "id": "scrubbed-call",
+                "type": "function",
+                "function": {"name": "patch", "arguments": patch_arguments},
+            }
+        ]
+    )
+    engine._store._conn.executemany(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                engine.current_session_id,
+                "subagent",
+                "tool",
+                terminal_result,
+                None,
+                None,
+                "terminal",
+                1.0,
+                1,
+                0,
+            ),
+            (
+                engine.current_session_id,
+                "subagent",
+                "assistant",
+                "",
+                None,
+                patch_tool_calls,
+                None,
+                2.0,
+                1,
+                0,
+            ),
+        ],
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 2
+    assert detail["externalized_payload_refs_missing"] == 2
+    assert {
+        row["externalized_ref"] for row in detail["missing_externalized_payload_refs"]
+    } == {"missing-terminal-owner.json", "missing-patch-owner.json"}
+
+
+def test_externalized_payload_integrity_scan_fails_closed_for_uncertain_source_container_shapes(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    terminal_example = (
+        '12: value = "[Externalized payload: kind=raw_payload; role=assistant; '
+        'chars=1; bytes=1; ref=uncertain-terminal.json]"'
+    )
+    terminal_result = json.dumps(
+        {
+            "output": terminal_example,
+            "exit_code": 0,
+            "error": None,
+            "unknown_provider_field": True,
+        }
+    )
+    patch_example = (
+        'value = "[Externalized payload: kind=raw_payload; role=assistant; '
+        'chars=1; bytes=1; ref=uncertain-patch.json]"'
+    )
+    patch_arguments = json.dumps(
+        {
+            "mode": "replace",
+            "path": "/scrubbed/module.py",
+            "old_string": "old source",
+            "new_string": patch_example,
+            "unknown_provider_field": True,
+        }
+    )
+    patch_tool_calls = json.dumps(
+        [
+            {
+                "id": "scrubbed-call",
+                "type": "function",
+                "function": {"name": "patch", "arguments": patch_arguments},
+            }
+        ]
+    )
+    engine._store._conn.executemany(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                engine.current_session_id,
+                "subagent",
+                "tool",
+                terminal_result,
+                None,
+                None,
+                "terminal",
+                1.0,
+                1,
+                0,
+            ),
+            (
+                engine.current_session_id,
+                "subagent",
+                "assistant",
+                "",
+                None,
+                patch_tool_calls,
+                None,
+                2.0,
+                1,
+                0,
+            ),
+        ],
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 2
+    assert detail["externalized_payload_refs_missing"] == 2
+    assert {
+        row["externalized_ref"] for row in detail["missing_externalized_payload_refs"]
+    } == {"uncertain-terminal.json", "uncertain-patch.json"}
+
+
 def test_externalized_payload_integrity_scan_ignores_code_search_placeholder_examples(tmp_path):
     engine = _engine(tmp_path)
     storage_dir = tmp_path / "externalized"
