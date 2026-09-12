@@ -705,19 +705,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ingest_protection_config=self._config,
                 hermes_home=hermes_home,
             )
-            self._dag = SummaryDAG(db_path)
+            journal_mode = self._config.sqlite_journal_mode
+            self._dag = SummaryDAG(db_path, journal_mode=journal_mode)
             if self._config.temporal_rollups_enabled:
                 # Install the transaction-coupled summary mutation triggers before
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
-            self._lifecycle = LifecycleStateStore(db_path)
+            self._lifecycle = LifecycleStateStore(
+                db_path, journal_mode=journal_mode
+            )
             self._assertions = (
-                AssertionStore(db_path)
+                AssertionStore(db_path, journal_mode=journal_mode)
                 if bool(getattr(self._config, "assertions_enabled", False))
                 else None
             )
             self._query_views = (
-                QueryViewStore(db_path)
+                QueryViewStore(db_path, journal_mode=journal_mode)
                 if bool(getattr(self._config, "query_views_enabled", False))
                 or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
                 else None

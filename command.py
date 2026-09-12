@@ -2429,7 +2429,10 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
     store = None
     outcomes: list[_RollupRebuildResult] = []
     try:
-        store = RollupStore(engine._dag.db_path)
+        store = RollupStore(
+            engine._dag.db_path,
+            journal_mode=engine._config.sqlite_journal_mode,
+        )
         if store.connection is None:  # pragma: no cover - RollupStore initialization contract
             raise RuntimeError("temporal rollup store is unavailable")
         # Durably seed a stale row for EVERY requested target BEFORE applying the

@@ -221,6 +221,7 @@ environment variables:
 | `LCM_ROLLUP_BUILDS_PER_PASS` | `2` | Maximum rollups built by one automatic pass or `/lcm rollups rebuild` command |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
+| `LCM_SQLITE_JOURNAL_MODE` | `wal` | SQLite journal policy: only `wal` or `delete`. `delete` is a reversible incident-containment mode and requires the zero-holder offline conversion below. Prefer `lcm.sqlite_journal_mode` in `config.yaml`; the environment variable overrides it. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 | `LCM_EMBEDDINGS_ENABLED` | `false` | Opt in to embedding warmup, backfill, and semantic retrieval storage |
@@ -238,6 +239,70 @@ environment variables:
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
+
+### SQLite DELETE-mode quarantine
+
+`wal` remains the default. Use `delete` only as temporary containment when an
+operator needs to eliminate WAL/SHM sidecars. DELETE mode uses
+`synchronous=FULL`, disables SQLite data-file mmap, and skips WAL auto-checkpoint
+and close-time checkpoint operations. The trade-off is lower concurrency:
+rollback-journal writes exclude readers and other writers, so multi-agent loads
+can see more lock waits, `SQLITE_BUSY` errors, and latency.
+
+**Do not change a live database from WAL to DELETE.** First stop the gateway and
+every CLI, worker, sub-agent, and service that can open the profile database.
+Then perform this zero-holder offline procedure (adjust `DB` explicitly for the
+profile):
+
+```bash
+DB="${HERMES_HOME:-$HOME/.hermes}/lcm.db"
+
+# This must print no holders. If it prints any process, stop here.
+files=()
+for file in "$DB" "$DB-wal" "$DB-shm"; do
+  [ -e "$file" ] && files+=("$file")
+done
+if [ "${#files[@]}" -gt 0 ] && lsof "${files[@]}"; then
+  echo "refusing live WAL conversion: SQLite holders remain" >&2
+  exit 1
+fi
+
+BACKUP="$DB.pre-delete.$(date -u +%Y%m%dT%H%M%SZ).backup"
+sqlite3 "$DB" ".backup '$BACKUP'"
+sqlite3 "$DB" <<'SQL'
+.timeout 30000
+PRAGMA wal_checkpoint(TRUNCATE);
+PRAGMA journal_mode=DELETE;
+PRAGMA quick_check;
+PRAGMA integrity_check;
+SQL
+
+test "$(sqlite3 "$DB" 'PRAGMA journal_mode;')" = delete
+test ! -e "$DB-wal"
+test ! -e "$DB-shm"
+```
+
+Both checks must report `ok`, the mode query must report `delete`, and neither
+sidecar may exist. If any check fails, keep services stopped and restore or
+investigate the backup; do not enable the quarantine on a partially converted
+database.
+
+After successful conversion, set the profile's `config.yaml` and restart:
+
+```yaml
+lcm:
+  sqlite_journal_mode: delete
+```
+
+If the service cannot consume that profile setting, set exactly
+`LCM_SQLITE_JOURNAL_MODE=delete` in its environment. Only `wal` and `delete` are
+accepted; invalid values fail startup. If a WAL holder survived the shutdown,
+LCM refuses startup with an offline-conversion error rather than silently
+continuing in WAL mode.
+
+To revert, stop and verify zero holders again, back up the database, run
+`PRAGMA journal_mode=WAL;`, verify it reports `wal`, then remove the setting (or
+set it to `wal`) before restarting.
 
 ### Evidence and adaptive retrieval (0.21 RC)
 

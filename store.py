@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
+    checkpoint_wal_on_close,
     configure_connection,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
@@ -333,6 +334,11 @@ class MessageStore:
         if not self._is_memory_database:
             _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
+        self._sqlite_journal_mode = (
+            ingest_protection_config.sqlite_journal_mode
+            if ingest_protection_config is not None
+            else None
+        )
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
@@ -357,7 +363,10 @@ class MessageStore:
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
+        configure_connection(
+            self._conn,
+            journal_mode=self._sqlite_journal_mode,
+        )
         if not self._is_memory_database:
             _restrict_existing_sqlite_artifacts(self.db_path)
         self._conn.executescript("""
@@ -1743,13 +1752,9 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
+            # Graceful WAL shutdown hygiene. DELETE quarantine mode skips the
+            # checkpoint entirely; PASSIVE may leave frames behind in WAL mode.
+            checkpoint_wal_on_close(conn)
             conn.close()
             self._conn = None
 

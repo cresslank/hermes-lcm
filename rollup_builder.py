@@ -73,7 +73,7 @@ class RollupWorkLimitExceeded(RuntimeError):
 
 def initialize_rollup_invalidation_outbox(dag: SummaryDAG) -> None:
     """Enable mutation triggers before the feature can publish summary nodes."""
-    store = RollupStore(dag.db_path)
+    store = RollupStore(dag.db_path, journal_mode=dag.journal_mode)
     store.close()
 
 
@@ -711,7 +711,7 @@ def mark_stale_for_published_summary(
     try:
         if not scope:
             return 0
-        store = RollupStore(dag.db_path)
+        store = RollupStore(dag.db_path, journal_mode=dag.journal_mode)
         return store.drain_invalidations(event_limit=256, day_budget=256) * 3
     except Exception:
         logger.debug("LCM temporal rollup publication staleness update failed", exc_info=True)
@@ -725,7 +725,7 @@ def mark_stale_for_deleted_nodes(dag: SummaryDAG, node_ids: Sequence[int]) -> in
     """Compatibility wrapper: mutation triggers own deletion invalidation."""
     store: RollupStore | None = None
     try:
-        store = RollupStore(dag.db_path)
+        store = RollupStore(dag.db_path, journal_mode=dag.journal_mode)
         before = store.has_pending_invalidations()
         drained = store.drain_invalidations(event_limit=256, day_budget=256)
         return drained if before else 0
@@ -754,7 +754,7 @@ def run_rollup_maintenance(
         connection = dag.connection
         if limit <= 0 or budget_ms <= 0 or connection is None:
             return 0
-        store = RollupStore(dag.db_path)
+        store = RollupStore(dag.db_path, journal_mode=dag.journal_mode)
         if (monotonic() - started_at) * 1000 >= budget_ms:
             return 0
         store.drain_invalidations(event_limit=256, day_budget=256)

@@ -2011,7 +2011,10 @@ def _recent_ready_rollups(
 
     store: RollupStore | None = None
     try:
-        store = RollupStore(engine._dag.db_path)
+        store = RollupStore(
+            engine._dag.db_path,
+            journal_mode=engine._config.sqlite_journal_mode,
+        )
         # A summary mutation and its invalidation event commit atomically.  Do
         # not serve a previously-ready rollup while that durable event is still
         # waiting for bounded maintenance to reconcile the affected periods.

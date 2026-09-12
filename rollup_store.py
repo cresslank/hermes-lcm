@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterator, NamedTuple, Optional, Sequence
 
 from .db_bootstrap import (
+    checkpoint_wal_on_close,
     configure_connection,
     ensure_temporal_rollup_tables,
     mark_migration_step_complete,
@@ -52,8 +53,9 @@ class RollupBuildToken(NamedTuple):
 class RollupStore:
     """SQLite-backed store for temporal rollups and their source nodes."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, journal_mode: str | None = None):
         self.db_path = Path(db_path)
+        self.journal_mode = journal_mode
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
@@ -66,7 +68,7 @@ class RollupStore:
             check_same_thread=False,
         )
         refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
+        configure_connection(self._conn, journal_mode=self.journal_mode)
         self._conn.row_factory = sqlite3.Row
         run_versioned_migrations(self._conn)
         # The rollup tables are a lazy, opt-in feature: they are NOT part of the
@@ -834,10 +836,7 @@ class RollupStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
+            checkpoint_wal_on_close(conn)
             conn.close()
             self._conn = None
 

@@ -199,7 +199,46 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold", "sqlite_journal_mode"}
+
+SQLITE_JOURNAL_MODES = frozenset({"wal", "delete"})
+
+
+def validate_sqlite_journal_mode(value: Any, *, source: str) -> str:
+    """Return a supported SQLite journal mode or fail closed."""
+    mode = value.strip().lower() if isinstance(value, str) else ""
+    if mode not in SQLITE_JOURNAL_MODES:
+        allowed = ", ".join(sorted(SQLITE_JOURNAL_MODES))
+        raise ValueError(f"{source} must be one of {allowed}; got {value!r}")
+    return mode
+
+
+def resolve_sqlite_journal_mode_with_source() -> tuple[str, str]:
+    """Resolve the process journal-mode policy (environment > config > WAL)."""
+    raw_env = os.environ.get("LCM_SQLITE_JOURNAL_MODE")
+    if raw_env is not None:
+        return (
+            validate_sqlite_journal_mode(raw_env, source="LCM_SQLITE_JOURNAL_MODE"),
+            "env:LCM_SQLITE_JOURNAL_MODE",
+        )
+
+    cfg = _load_hermes_config_yaml()
+    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
+    if isinstance(lcm_section, dict) and "sqlite_journal_mode" in lcm_section:
+        return (
+            validate_sqlite_journal_mode(
+                lcm_section["sqlite_journal_mode"],
+                source="config_yaml:lcm.sqlite_journal_mode",
+            ),
+            "config_yaml:lcm.sqlite_journal_mode",
+        )
+    return "wal", "default"
+
+
+def resolve_sqlite_journal_mode() -> str:
+    """Return the validated process journal-mode policy."""
+    mode, _source = resolve_sqlite_journal_mode_with_source()
+    return mode
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -369,6 +408,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
+    _EnvFieldSpec("sqlite_journal_mode", "LCM_SQLITE_JOURNAL_MODE", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
@@ -429,6 +469,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
+    "sqlite_journal_mode",
 })
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
@@ -602,6 +643,9 @@ class LCMConfig:
 
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
+    # WAL is the compatibility default. DELETE is an operator quarantine mode
+    # that must be paired with the documented zero-holder offline conversion.
+    sqlite_journal_mode: str = "wal"
 
     # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False
@@ -776,6 +820,11 @@ class LCMConfig:
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.sqlite_journal_mode = validate_sqlite_journal_mode(
+            self.sqlite_journal_mode, source="LCMConfig.sqlite_journal_mode"
+        )
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -789,6 +838,8 @@ class LCMConfig:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        c.sqlite_journal_mode, source = resolve_sqlite_journal_mode_with_source()
+        _record("sqlite_journal_mode", source)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
