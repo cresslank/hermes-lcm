@@ -25817,6 +25817,102 @@ class TestEngineTools:
         assert "config_validation" in check_names
         assert all(c["status"] == "pass" for c in result["checks"])
 
+    def test_handle_doctor_does_not_warn_for_pending_ingest_only(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "pending-doctor.db"))
+        config.empty_lifecycle_gc_max_age_hours = 1.0
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
+        try:
+            engine.on_session_start(
+                "fresh-runtime-session", platform="cli", context_length=200000
+            )
+
+            result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+            lifecycle_check = next(
+                check
+                for check in result["checks"]
+                if check["check"] == "lifecycle_fragmentation"
+            )
+            categories = lifecycle_check["detail"]["classification"]["categories"]
+
+            assert result["overall"] == "healthy"
+            assert lifecycle_check["status"] == "pass"
+            assert lifecycle_check["detail"]["empty_lifecycle_rows"] == 1
+            assert lifecycle_check["detail"]["actionable_empty_lifecycle_rows"] == 0
+            assert any(
+                item["name"] == "pending_ingest_current"
+                and item["severity"] == "notice"
+                for item in categories
+            )
+
+            # The diagnostic uses the same configured age guard as lifecycle GC.
+            engine._config.empty_lifecycle_gc_max_age_hours = 0.0
+            expired_result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+            expired_check = next(
+                check
+                for check in expired_result["checks"]
+                if check["check"] == "lifecycle_fragmentation"
+            )
+            assert expired_result["overall"] == "warnings"
+            assert expired_check["status"] == "warn"
+            assert any(
+                item["name"] == "stale_lifecycle_current"
+                for item in expired_check["detail"]["classification"]["categories"]
+            )
+        finally:
+            engine.shutdown()
+
+    def test_handle_doctor_warns_for_ended_host_current_with_finalized_history(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_conn = sqlite3.connect(hermes_home / "state.db")
+        state_conn.executescript(
+            """
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, ended_at REAL);
+            INSERT INTO sessions(id, ended_at)
+            VALUES ('20260911_134917_323dddc0', 2.0);
+            """
+        )
+        state_conn.commit()
+        state_conn.close()
+        config = LCMConfig(database_path=str(tmp_path / "ended-doctor.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        try:
+            current_session = "20260911_134917_323dddc0"
+            engine.on_session_start(current_session, platform="cli", context_length=200000)
+            engine._store.append(
+                "healthy-finalized",
+                {"role": "user", "content": "preserved finalized history"},
+                source="cli",
+            )
+            engine._lifecycle._conn.execute(
+                """UPDATE lcm_lifecycle_state
+                   SET last_finalized_session_id = ?, last_finalized_at = ?
+                   WHERE conversation_id = ?""",
+                ("healthy-finalized", time.time() - 60.0, current_session),
+            )
+            engine._lifecycle._conn.commit()
+
+            result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+            lifecycle_check = next(
+                check
+                for check in result["checks"]
+                if check["check"] == "lifecycle_fragmentation"
+            )
+            categories = lifecycle_check["detail"]["classification"]["categories"]
+
+            assert result["overall"] == "warnings"
+            assert lifecycle_check["status"] == "warn"
+            assert lifecycle_check["detail"]["empty_lifecycle_rows"] == 0
+            assert any(
+                item["name"] == "unfinalized_host_current"
+                and item["sample_session_ids"] == [current_session]
+                for item in categories
+            )
+            assert engine._store.get_session_count(current_session) == 0
+            assert engine._store.get_session_count("healthy-finalized") == 1
+        finally:
+            engine.shutdown()
+
     def test_handle_doctor_reports_fts_integrity_failures_separately(self, engine, monkeypatch):
         def fake_fts_integrity(_conn, spec):
             if spec.table_name == "nodes_fts":
@@ -25912,7 +26008,7 @@ class TestEngineTools:
         assert lifecycle_check["detail"]["read_only"] is True
         assert engine._lifecycle.row_count() == 2
 
-    def test_handle_doctor_keeps_retained_history_lifecycle_drift_healthy(self, engine, tmp_path):
+    def test_handle_doctor_warns_on_aged_retained_history_lifecycle_drift(self, engine, tmp_path):
         engine._hermes_home = str(tmp_path / "hermes_home")
         state_db = tmp_path / "hermes_home" / "state.db"
         state_db.parent.mkdir(parents=True, exist_ok=True)
@@ -25956,11 +26052,12 @@ class TestEngineTools:
 
         result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
-        assert result["overall"] == "healthy"
+        assert result["overall"] == "warnings"
         lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
-        assert lifecycle_check["status"] == "pass"
+        assert lifecycle_check["status"] == "warn"
         detail = lifecycle_check["detail"]
         assert detail["empty_lifecycle_rows"] == 0
+        assert detail["actionable_empty_lifecycle_rows"] == 0
         assert detail["lifecycle_current_missing_in_lcm_any"] == 1
         assert detail["lifecycle_last_finalized_missing_in_lcm_any"] == 1
         assert detail["lcm_message_sessions_missing_in_state"] == 3
@@ -25975,7 +26072,7 @@ class TestEngineTools:
             item["name"] == "stale_lifecycle_finalized" and item["severity"] == "warn"
             for item in detail["classification"]["categories"]
         )
-        assert not result["guidance"]
+        assert result["guidance"]
 
     def test_handle_doctor_warns_when_existing_state_db_is_unreadable(self, engine, tmp_path):
         engine._hermes_home = str(tmp_path / "hermes_home")

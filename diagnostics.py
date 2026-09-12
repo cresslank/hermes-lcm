@@ -49,13 +49,14 @@ def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
     """Return whether lifecycle diagnostics should be treated as warning evidence.
 
     Retained-history drift is intentionally read-only diagnostic context. Keep the
-    doctor warning for concrete operator action (empty lifecycle rows that the
-    explicit backup-first cleanup path can prune) or diagnostic unreadability, but
-    do not make overall health unhealthy solely because historical LCM/state
-    indexes no longer agree.
+    doctor warning for actionable empty rows, warning classifications, or diagnostic
+    unreadability, but do not warn on recent pending-ingest lifecycle binds.
     """
-    empty_lifecycle_rows = int(stats.get("empty_lifecycle_rows", 0) or 0)
-    return empty_lifecycle_rows > 0 or (
+    actionable_empty_rows = int(
+        stats.get("actionable_empty_lifecycle_rows", stats.get("empty_lifecycle_rows", 0)) or 0
+    )
+    classification = stats.get("classification") or {}
+    return actionable_empty_rows > 0 or classification.get("status") == "warn" or (
         bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
     )
 

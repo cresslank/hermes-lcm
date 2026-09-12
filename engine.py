@@ -33,6 +33,7 @@ from .engine_registry import (
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
     _ACTIVE_ENGINES_BY_SESSION_ID,
     _remove_registry_entries_for_engine,
+    active_lcm_session_ids,
     resolve_active_lcm_engine,  # noqa: F401  (re-exported: hosts import it from .engine)
 )
 from .escalation import (
@@ -1922,6 +1923,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._conversation_id,
             self._session_id,
             self._last_compacted_store_id,
+        )
+
+    def _lifecycle_fragmentation_stats(self) -> dict[str, Any]:
+        """Read lifecycle diagnostics with runtime and configured age protection."""
+        return self._lifecycle.get_fragmentation_stats(
+            state_db_path=self._state_db_path(),
+            pending_ingest_max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
+            runtime_protected_session_ids=active_lcm_session_ids(),
         )
 
     def _has_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> bool:
@@ -3968,9 +3977,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except Exception as exc:  # pragma: no cover - defensive
             status["source_lineage"] = {"error": str(exc)}
         try:
-            status["lifecycle_fragmentation"] = self._lifecycle.get_fragmentation_stats(
-                state_db_path=self._state_db_path()
-            )
+            status["lifecycle_fragmentation"] = self._lifecycle_fragmentation_stats()
         except Exception as exc:  # pragma: no cover - defensive
             status["lifecycle_fragmentation"] = {"error": str(exc), "read_only": True}
         try:

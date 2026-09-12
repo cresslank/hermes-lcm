@@ -373,7 +373,13 @@ class LifecycleStateStore:
         assert updated is not None
         return updated
 
-    def get_fragmentation_stats(self, state_db_path: str | Path | None = None) -> dict[str, Any]:
+    def get_fragmentation_stats(
+        self,
+        state_db_path: str | Path | None = None,
+        *,
+        pending_ingest_max_age_hours: float | None = None,
+        runtime_protected_session_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
         """Return read-only lifecycle/session fragmentation diagnostics.
 
         This intentionally reports mismatches only. It does not infer that every
@@ -398,6 +404,8 @@ class LifecycleStateStore:
         node_sessions = _session_ids("SELECT DISTINCT session_id FROM summary_nodes WHERE session_id IS NOT NULL")
         lcm_any_sessions = message_sessions | node_sessions
         state_sessions: set[str] = set()
+        host_open_sessions: set[str] = set()
+        host_ended_sessions: set[str] = set()
         state_db_read_success = False
         lifecycle_current_sessions = _session_ids(
             "SELECT DISTINCT current_session_id FROM lcm_lifecycle_state WHERE current_session_id IS NOT NULL"
@@ -407,25 +415,41 @@ class LifecycleStateStore:
         )
         lifecycle_referenced_sessions = lifecycle_current_sessions | lifecycle_last_finalized_sessions
 
-        empty_lifecycle_rows = 0
-        for row in conn.execute(
+        lifecycle_rows_data = conn.execute(
             """
-            SELECT current_session_id, last_finalized_session_id
+            SELECT conversation_id, current_session_id, last_finalized_session_id,
+                   current_bound_at, last_finalized_at, updated_at
             FROM lcm_lifecycle_state
             """
-        ).fetchall():
+        ).fetchall()
+        empty_rows: list[sqlite3.Row] = []
+        current_bound_at_by_session: dict[str, float] = {}
+        for row in lifecycle_rows_data:
+            current_session_id = str(row["current_session_id"] or "")
+            if current_session_id:
+                bound_at = float(
+                    row["current_bound_at"]
+                    or row["last_finalized_at"]
+                    or row["updated_at"]
+                    or 0.0
+                )
+                current_bound_at_by_session[current_session_id] = max(
+                    bound_at,
+                    current_bound_at_by_session.get(current_session_id, 0.0),
+                )
             refs = {
                 str(value)
                 for value in (row["current_session_id"], row["last_finalized_session_id"])
                 if value
             }
             if not refs or refs.isdisjoint(lcm_any_sessions):
-                empty_lifecycle_rows += 1
+                empty_rows.append(row)
 
         stats: dict[str, Any] = {
             "read_only": True,
             "lifecycle_rows": _count("SELECT COUNT(*) FROM lcm_lifecycle_state"),
-            "empty_lifecycle_rows": empty_lifecycle_rows,
+            "empty_lifecycle_rows": len(empty_rows),
+            "actionable_empty_lifecycle_rows": len(empty_rows),
             "messages_total": _count("SELECT COUNT(*) FROM messages"),
             "summary_nodes_total": _count("SELECT COUNT(*) FROM summary_nodes"),
             "distinct_message_sessions": len(message_sessions),
@@ -461,10 +485,28 @@ class LifecycleStateStore:
                     state_uri = path.resolve().as_uri() + "?mode=ro"
                     state_conn = sqlite3.connect(state_uri, uri=True)
                     try:
-                        state_rows = state_conn.execute("SELECT id FROM sessions WHERE id IS NOT NULL").fetchall()
+                        session_columns = {
+                            str(row[1])
+                            for row in state_conn.execute("PRAGMA table_info(sessions)").fetchall()
+                        }
+                        if "ended_at" in session_columns:
+                            state_rows = state_conn.execute(
+                                "SELECT id, ended_at FROM sessions WHERE id IS NOT NULL"
+                            ).fetchall()
+                        else:
+                            state_rows = state_conn.execute(
+                                "SELECT id FROM sessions WHERE id IS NOT NULL"
+                            ).fetchall()
                     finally:
                         state_conn.close()
                     state_sessions = {str(row[0]) for row in state_rows if row[0]}
+                    if "ended_at" in session_columns:
+                        host_open_sessions = {
+                            str(row[0]) for row in state_rows if row[0] and row[1] is None
+                        }
+                        host_ended_sessions = {
+                            str(row[0]) for row in state_rows if row[0] and row[1] is not None
+                        }
                     state_db_read_success = True
                     stats.update({
                         "state_sessions_total": len(state_sessions),
@@ -482,6 +524,43 @@ class LifecycleStateStore:
             else:
                 stats["state_db_error"] = f"state database not found: {path}"
 
+        missing_current_sessions = lifecycle_current_sessions - lcm_any_sessions
+        recent_current_sessions: set[str] = set()
+        if pending_ingest_max_age_hours is not None and pending_ingest_max_age_hours > 0:
+            cutoff = time.time() - (float(pending_ingest_max_age_hours) * 3600.0)
+            recent_current_sessions = {
+                session_id
+                for session_id in missing_current_sessions
+                if current_bound_at_by_session.get(session_id, 0.0) >= cutoff
+            }
+        runtime_protected = {
+            str(session_id)
+            for session_id in (runtime_protected_session_ids or set())
+            if session_id
+        }
+        hostless_sessions = (
+            missing_current_sessions - state_sessions if state_db_read_success else set()
+        )
+        pending_ingest_current_sessions = (
+            recent_current_sessions
+            & (host_open_sessions | runtime_protected | hostless_sessions)
+            - host_ended_sessions
+        )
+        unfinalized_host_current_sessions = missing_current_sessions & host_ended_sessions
+        stale_lifecycle_current_sessions = (
+            missing_current_sessions
+            - pending_ingest_current_sessions
+            - unfinalized_host_current_sessions
+        )
+        stats["actionable_empty_lifecycle_rows"] = sum(
+            1
+            for row in empty_rows
+            if not (
+                str(row["current_session_id"] or "") in pending_ingest_current_sessions
+                and not row["last_finalized_session_id"]
+            )
+        )
+
         stats["classification"] = self._classify_fragmentation(
             lifecycle_rows=stats["lifecycle_rows"],
             lifecycle_current_sessions=lifecycle_current_sessions,
@@ -492,6 +571,9 @@ class LifecycleStateStore:
             lifecycle_referenced_sessions=lifecycle_referenced_sessions,
             state_sessions=state_sessions,
             state_db_read_success=state_db_read_success,
+            pending_ingest_current_sessions=pending_ingest_current_sessions,
+            unfinalized_host_current_sessions=unfinalized_host_current_sessions,
+            stale_lifecycle_current_sessions=stale_lifecycle_current_sessions,
         )
 
         return stats
@@ -508,6 +590,9 @@ class LifecycleStateStore:
         lifecycle_referenced_sessions: set[str],
         state_sessions: set[str],
         state_db_read_success: bool,
+        pending_ingest_current_sessions: set[str],
+        unfinalized_host_current_sessions: set[str],
+        stale_lifecycle_current_sessions: set[str],
     ) -> dict[str, Any]:
         """Bucket lifecycle mismatches into operator-readable read-only categories."""
 
@@ -536,8 +621,22 @@ class LifecycleStateStore:
             })
 
         add_category(
+            "pending_ingest_current",
+            pending_ingest_current_sessions,
+            severity="notice",
+            description="Recently-bound current sessions have not completed their first durable LCM ingest.",
+            recommended_action="Allow the active/open/hostless runtime turn to finish; recheck after the configured lifecycle age guard.",
+        )
+        add_category(
+            "unfinalized_host_current",
+            unfinalized_host_current_sessions,
+            severity="warn",
+            description="Ended Hermes host sessions remain bound as current but have no raw messages or summary nodes in LCM.",
+            recommended_action="Inspect host end/reset handling; preserve finalized history and do not reingest or clean automatically.",
+        )
+        add_category(
             "stale_lifecycle_current",
-            lifecycle_current_sessions - lcm_any_sessions,
+            stale_lifecycle_current_sessions,
             severity="warn",
             description="Lifecycle current-session references that no longer have raw messages or summary nodes in LCM.",
             recommended_action="Inspect samples before cleanup; these are often old or ephemeral lifecycle rows, not automatic corruption.",

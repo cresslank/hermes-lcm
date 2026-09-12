@@ -3241,6 +3241,96 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_lifecycle_fragmentation_partitions_missing_current_by_ingest_and_host_state(self, tmp_path):
+        db_path = tmp_path / "lifecycle-current-partitions.db"
+        state_db = tmp_path / "state.db"
+        store = MessageStore(db_path)
+        SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+
+        state.bind_session("fresh-open", conversation_id="conv-open")
+        state.bind_session("fresh-hostless", conversation_id="conv-hostless")
+        state.bind_session("expired-hostless", conversation_id="conv-expired")
+        state.bind_session("20260911_134917_323dddc0", conversation_id="conv-ended")
+        store.append(
+            "healthy-finalized",
+            {"role": "user", "content": "preserved finalized history"},
+            source="cli",
+        )
+        state._conn.execute(
+            """UPDATE lcm_lifecycle_state
+               SET last_finalized_session_id = ?, last_finalized_at = ?
+               WHERE conversation_id = ?""",
+            ("healthy-finalized", time.time() - 60.0, "conv-ended"),
+        )
+        state._conn.execute(
+            """UPDATE lcm_lifecycle_state
+               SET current_bound_at = ?, updated_at = ?
+               WHERE conversation_id = ?""",
+            (time.time() - 7200.0, time.time() - 7200.0, "conv-expired"),
+        )
+        state._conn.commit()
+
+        state_conn = sqlite3.connect(state_db)
+        state_conn.executescript(
+            """
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, ended_at REAL);
+            INSERT INTO sessions(id, ended_at) VALUES ('fresh-open', NULL);
+            INSERT INTO sessions(id, ended_at)
+            VALUES ('20260911_134917_323dddc0', 2.0);
+            """
+        )
+        state_conn.commit()
+        state_conn.close()
+
+        stats = state.get_fragmentation_stats(
+            state_db_path=state_db,
+            pending_ingest_max_age_hours=1.0,
+        )
+        categories = {
+            item["name"]: item for item in stats["classification"]["categories"]
+        }
+
+        assert stats["empty_lifecycle_rows"] == 3
+        assert stats["actionable_empty_lifecycle_rows"] == 1
+        assert categories["pending_ingest_current"]["severity"] == "notice"
+        assert categories["pending_ingest_current"]["sample_session_ids"] == [
+            "fresh-hostless",
+            "fresh-open",
+        ]
+        assert categories["stale_lifecycle_current"]["sample_session_ids"] == [
+            "expired-hostless"
+        ]
+        assert categories["unfinalized_host_current"]["sample_session_ids"] == [
+            "20260911_134917_323dddc0"
+        ]
+        assert store.get_session_count("healthy-finalized") == 1
+        assert state.get_by_conversation("conv-ended").last_finalized_session_id == "healthy-finalized"
+
+        unavailable_stats = state.get_fragmentation_stats(
+            pending_ingest_max_age_hours=1.0,
+        )
+        unavailable_categories = {
+            item["name"]: item
+            for item in unavailable_stats["classification"]["categories"]
+        }
+        assert "pending_ingest_current" not in unavailable_categories
+        assert "fresh-open" in unavailable_categories["stale_lifecycle_current"][
+            "sample_session_ids"
+        ]
+
+        runtime_stats = state.get_fragmentation_stats(
+            pending_ingest_max_age_hours=1.0,
+            runtime_protected_session_ids={"fresh-hostless"},
+        )
+        runtime_categories = {
+            item["name"]: item for item in runtime_stats["classification"]["categories"]
+        }
+        assert runtime_categories["pending_ingest_current"]["sample_session_ids"] == [
+            "fresh-hostless"
+        ]
+        state.close()
+
     def test_lifecycle_fragmentation_stats_does_not_classify_legacy_lcm_rows_without_lifecycle_state(self, tmp_path):
         db_path = tmp_path / "legacy-lcm-without-lifecycle.db"
         store = MessageStore(db_path)

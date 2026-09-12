@@ -1532,9 +1532,7 @@ def _doctor_text(engine) -> str:
         )
 
     try:
-        lifecycle_stats = engine._lifecycle.get_fragmentation_stats(
-            state_db_path=_state_db_path_for_engine(engine)
-        )
+        lifecycle_stats = engine._lifecycle_fragmentation_stats()
     except Exception as exc:  # pragma: no cover - defensive
         issues.append("lifecycle_fragmentation")
         lifecycle_stats = {"error": str(exc)}
@@ -1543,6 +1541,7 @@ def _doctor_text(engine) -> str:
             "lifecycle_fragmentation: "
             f"lifecycle_rows={lifecycle_stats['lifecycle_rows']} "
             f"empty_lifecycle_rows={lifecycle_stats.get('empty_lifecycle_rows', 0)} "
+            f"actionable_empty_lifecycle_rows={lifecycle_stats.get('actionable_empty_lifecycle_rows', 0)} "
             f"message_sessions={lifecycle_stats['distinct_message_sessions']} "
             f"node_sessions={lifecycle_stats['distinct_node_sessions']} "
             f"current_missing_in_lcm_any={lifecycle_stats['lifecycle_current_missing_in_lcm_any']} "

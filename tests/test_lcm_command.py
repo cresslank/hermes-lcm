@@ -915,6 +915,20 @@ def test_lcm_doctor_source_apply_is_backup_first_and_idempotent(tmp_path):
     assert stats_after["legacy_blank_source_messages"] == 0
 
 
+def test_lcm_doctor_pending_ingest_is_notice_without_action_recommendation(engine):
+    engine._config.empty_lifecycle_gc_max_age_hours = 1.0
+    engine.on_session_start("fresh-runtime-session", platform="cli", context_length=200000)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: ok" in result
+    assert "empty_lifecycle_rows=1" in result
+    assert "actionable_empty_lifecycle_rows=0" in result
+    assert "lifecycle_category pending_ingest_current: count=1 sample=fresh-runtime-session" in result
+    assert "lifecycle_category stale_lifecycle_current" not in result
+    assert "triage_guidance:\n- none" in result
+
+
 def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(engine):
     state_db = Path(engine._hermes_home) / "state.db"
     state_db.parent.mkdir(parents=True, exist_ok=True)

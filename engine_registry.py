@@ -20,6 +20,16 @@ _ACTIVE_ENGINES_BY_SESSION_ID = weakref.WeakValueDictionary()
 _ACTIVE_ENGINES_BY_CONVERSATION_ID = weakref.WeakValueDictionary()
 
 
+def active_lcm_session_ids() -> set[str]:
+    """Return session ids currently protected by a live in-process LCM engine."""
+    with _ACTIVE_ENGINE_REGISTRY_LOCK:
+        return {
+            str(session_id)
+            for session_id, engine in _ACTIVE_ENGINES_BY_SESSION_ID.items()
+            if _engine_matches_session_binding(engine, str(session_id))
+        }
+
+
 def _is_usable_lcm_engine(engine: Any) -> bool:
     return bool(
         engine is not None
