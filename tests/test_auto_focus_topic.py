@@ -9,7 +9,15 @@ Covers:
 - no leakage of configured sensitive values from structured content or bearer-style text
 """
 
+from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+
+
+def _engine(tmp_path):
+    return LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "auto-focus.db")),
+        hermes_home=str(tmp_path / "hermes-home"),
+    )
 
 
 class TestDeriveAutoFocusTopic:
@@ -18,7 +26,7 @@ class TestDeriveAutoFocusTopic:
     # --- Test 1: derives from latest real user turns ---
 
     def test_derives_from_latest_user_turns(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "assistant", "content": "Previous assistant reply"},
@@ -41,14 +49,14 @@ class TestDeriveAutoFocusTopic:
             engine.shutdown()
 
     def test_returns_none_for_empty_messages(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             assert engine._derive_auto_focus_topic([]) is None
         finally:
             engine.shutdown()
 
     def test_returns_none_for_no_user_messages(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "assistant", "content": "Reply one"},
@@ -61,7 +69,7 @@ class TestDeriveAutoFocusTopic:
     # --- Test 2: skips synthetic context-summary content ---
 
     def test_skips_context_compaction_summary(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "user", "content": "Please check config.yaml"},
@@ -78,7 +86,7 @@ class TestDeriveAutoFocusTopic:
             engine.shutdown()
 
     def test_skips_all_summary_markers(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             summaries = [
                 "[CONTEXT COMPACTION] something",
@@ -109,7 +117,7 @@ class TestDeriveAutoFocusTopic:
         The actual guard is in compress(): ``if focus_topic is None`` -- so
         when focus_topic is provided, this method is never called.
         """
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "user", "content": "First user message"},
@@ -124,7 +132,7 @@ class TestDeriveAutoFocusTopic:
     # --- Test 4: per-turn and total truncation ---
 
     def test_per_turn_truncation(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             long_msg = "x" * 500
             messages = [{"role": "user", "content": long_msg}]
@@ -135,7 +143,7 @@ class TestDeriveAutoFocusTopic:
             engine.shutdown()
 
     def test_total_truncation(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             # 3 long messages should exceed total limit of _AUTO_FOCUS_MAX_CHARS (700)
             messages = [
@@ -150,7 +158,7 @@ class TestDeriveAutoFocusTopic:
             engine.shutdown()
 
     def test_max_3_turns(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "user", "content": "Message four"},
@@ -171,7 +179,7 @@ class TestDeriveAutoFocusTopic:
     # --- Test 5: multimodal/text-part content ---
 
     def test_multimodal_content(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "user", "content": "Look at this image"},
@@ -189,7 +197,7 @@ class TestDeriveAutoFocusTopic:
         """Sensitive values in working_messages are already redacted by
         _ingest_messages -> _redact_active_replay_messages, so the derived
         focus topic must not contain raw secrets."""
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             engine._session_id = "test-focus-session"
             # Simulate raw messages that would be ingested
@@ -210,7 +218,7 @@ class TestDeriveAutoFocusTopic:
 
     def test_structured_content_no_leakage(self, tmp_path):
         """Dict/JSON token values in working_messages are redacted."""
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             # Simulate working_messages where content is already redacted
             # by _redact_active_replay_messages for dict-type content
@@ -304,7 +312,7 @@ class TestDeriveAutoFocusTopic:
     # --- Skip empty user messages ---
 
     def test_skips_empty_user_messages(self, tmp_path):
-        engine = LCMEngine(config=None)
+        engine = _engine(tmp_path)
         try:
             messages = [
                 {"role": "user", "content": ""},
