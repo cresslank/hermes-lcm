@@ -8,7 +8,7 @@ or install packages to make an assurance tool pass.
 
 The authoritative, versioned contract is
 [`dependency-contract.json`](../dependency-contract.json). Contract version
-`1.0.5` supports:
+`1.0.6` supports:
 
 - Hermes Agent `>=0.16,<1`
 - Python 3.11, 3.12, 3.13, and 3.14 (the CI matrix)
@@ -19,6 +19,11 @@ The authoritative, versioned contract is
 The Hermes-LCM maintainers own contract updates. Increment the contract version
 and review the boundary whenever a scanned runtime import, supported Python or
 Hermes Agent version, or required imported API changes.
+
+The redaction stress benchmark additionally needs `cryptography` for disposable
+Ed25519 fixture generation. It is imported only when that scenario runs, never
+by ordinary plugin loading. CI and the documented test setup install it; missing
+support fails the scenario rather than skipping redaction coverage.
 
 ## Mechanical validation
 

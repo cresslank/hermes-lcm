@@ -26,7 +26,7 @@ from .externalize import (
 from .embedding_provider import VoyageError, default_chunk_model, resolve_provider
 from .diagnostics import (
     _has_lifecycle_fragmentation,
-    _state_db_path_for_engine,
+    _state_db_path_for_engine as _state_db_path_for_engine,
     doctor_guidance_for_checks,
 )
 from .dag import build_nodes_fts_spec

@@ -63,6 +63,66 @@ def _assert_path_under(path_value: str, root: Path) -> None:
     assert Path(path_value).resolve().is_relative_to(root.resolve())
 
 
+def test_redaction_fixture_is_a_fresh_parseable_private_key():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from benchmarking import stress
+
+    first = stress._ephemeral_redaction_private_key()
+    second = stress._ephemeral_redaction_private_key()
+    assert first != second
+    for value in (first, second):
+        parsed = serialization.load_pem_private_key(value.encode("ascii"), password=None)
+        assert isinstance(parsed, Ed25519PrivateKey)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_generated_fixture_exercises_private_key_text_redaction(enabled):
+    from benchmarking import stress
+    from hermes_lcm.ingest_protection import redact_sensitive_text
+
+    value = stress._ephemeral_redaction_private_key()
+    config = types.SimpleNamespace(
+        sensitive_patterns_enabled=enabled, sensitive_patterns=["private_key"]
+    )
+    text = "before\n" + value + "\nafter"
+    redacted = redact_sensitive_text(text, config)
+    if enabled:
+        assert value.strip() not in redacted
+        assert all(line not in redacted for line in value.splitlines())
+        assert redacted.startswith("before\n") and redacted.endswith("\nafter")
+    else:
+        assert redacted == text  # Negative control: the pattern actually matters.
+
+
+@pytest.mark.filterwarnings("ignore:.*__package__ != __spec__.*:DeprecationWarning")
+def test_generated_key_never_persists_in_redaction_stress_artifacts(tmp_path, monkeypatch):
+    from benchmarking import stress
+
+    generated = []
+    original = stress._ephemeral_redaction_private_key
+
+    def capture_fixture():
+        value = original()
+        generated.append(value)
+        return value
+
+    monkeypatch.setattr(stress, "_ephemeral_redaction_private_key", capture_fixture)
+    output_dir = tmp_path / "redaction-only"
+    result = stress.run_stress_check(
+        output_dir=output_dir, tier="smoke", scenarios=["redaction_and_externalization_boundaries"]
+    )
+    assert result["failure_count"] == 0
+    assert len(generated) == 1
+    body = "".join(generated[0].splitlines()[1:-1]).encode("ascii")
+    persisted = [path for path in output_dir.rglob("*") if path.is_file()]
+    assert persisted
+    for path in persisted:
+        data = path.read_bytes()
+        assert generated[0].encode("ascii") not in data, path.name
+        assert body not in data, path.name
+
+
 def test_lcm_grep_result_rows_collects_every_supported_container():
     from benchmarking import stress
 

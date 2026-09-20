@@ -27,7 +27,7 @@ from .db_bootstrap import (
 )
 from .diagnostics import (
     _has_lifecycle_fragmentation,
-    _state_db_path_for_engine,
+    _state_db_path_for_engine as _state_db_path_for_engine,
     doctor_guidance_for_checks,
 )
 from .ingest_protection import (

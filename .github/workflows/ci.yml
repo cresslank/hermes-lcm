@@ -53,7 +53,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test dependencies
-        run: pip install pytest numpy
+        run: pip install pytest numpy cryptography
 
       - name: Stub hermes-agent ABC
         run: |

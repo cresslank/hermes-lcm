@@ -638,13 +638,30 @@ def _case_multi_cycle_canary_recall(run: StressRun) -> None:
         engine.shutdown()
 
 
+def _ephemeral_redaction_private_key() -> str:
+    """Generate an untrusted, in-memory test key; never ship a reusable key fixture.
+
+    This benchmark-only dependency is deliberately lazy: ordinary plugin use and
+    stress cases unrelated to credential redaction do not need cryptography.
+    The key has no external identity or authority and is discarded after the case.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    return Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
 def _case_redaction_and_externalization_boundaries(run: StressRun) -> None:
     case = "redaction_and_externalization_boundaries"
     secret_values = [
         "sk-tes...cdef",
         "Bearer abcdef1234567890SECRETXYZ",
         "correct horse battery staple",
-        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSTRESSKEY\n-----END PRIVATE KEY-----",
+        _ephemeral_redaction_private_key(),
     ]
     large_blob = base64.b64encode(("LCM-LARGE-PAYLOAD-" * 800).encode()).decode()
     data_url = "data:image/png;base64," + large_blob
@@ -664,7 +681,7 @@ def _case_redaction_and_externalization_boundaries(run: StressRun) -> None:
             {"role": "user", "content": f"api_key = {secret_values[0]} and authorization: {secret_values[1]}"},
             {"role": "assistant", "content": "running command", "tool_calls": [{"id": "secret-call", "type": "function", "function": {"name": "login", "arguments": json.dumps({"password": secret_values[2], "client_secret": secret_values[0]})}}]},
             {"role": "tool", "tool_call_id": "secret-call", "name": "login", "content": json.dumps({"private_key": secret_values[3], "blob": data_url, "token": secret_values[1]})},
-            {"role": "user", "content": "CANARY_SECRET_0001 = VALUE_SECRET_0001 " + ("padding " * 100)},
+            {"role": "user", "content": "Ephemeral redaction fixture:\n" + secret_values[3] + "\nCANARY_SECRET_0001 = VALUE_SECRET_0001 " + ("padding " * 100)},
             {"role": "assistant", "content": "ack CANARY_SECRET_0001 VALUE_SECRET_0001"},
         ]
         compressed = engine.compress(messages, current_tokens=4_500)

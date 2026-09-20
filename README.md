@@ -840,12 +840,15 @@ tests/           standalone pytest coverage
 Run tests:
 
 ```bash
-pip install pytest
+pip install pytest numpy cryptography
 python -m pytest tests/ -v
 ```
 
 No Hermes Agent checkout is required for the test suite; tests include a
-lightweight ABC stub.
+lightweight ABC stub. The redaction stress scenario uses `cryptography` to
+generate a disposable, in-memory private key rather than embedding a reusable
+credential fixture. This is a test/benchmark dependency, not a plugin runtime
+requirement; the generated key has no external identity or authority.
 
 ## Contributing
 

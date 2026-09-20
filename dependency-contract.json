@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.5",
+  "contract_version": "1.0.6",
   "boundary": "host-owned",
   "imported_api_validation": "observed-coverage-only",
   "description": "Hermes-LCM is a source-installed Hermes Agent plugin. Hermes Agent owns the Python environment and dependency resolution; the plugin declares the host and optional feature imports it consumes without creating a second package installer or lock.",
@@ -45,6 +45,18 @@
         "agent.auxiliary_client.call_llm",
         "agent.context_compressor",
         "agent.model_metadata.get_model_context_length"
+      ]
+    },
+    "cryptography": {
+      "distribution": "cryptography",
+      "availability": "optional",
+      "scope": "redaction stress benchmark only; required for this scenario and its tests",
+      "version_policy": "host-resolved; supported when Ed25519PrivateKey.generate and PKCS8 PEM serialization are available; no import during ordinary plugin use",
+      "imported_api": [
+        "cryptography.hazmat.primitives.asymmetric.ed25519.Ed25519PrivateKey.generate",
+        "cryptography.hazmat.primitives.serialization.Encoding.PEM",
+        "cryptography.hazmat.primitives.serialization.PrivateFormat.PKCS8",
+        "cryptography.hazmat.primitives.serialization.NoEncryption"
       ]
     },
     "fastembed": {
