@@ -4,15 +4,16 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 
-EXPECTED_LCM_TOOLS = {
+
+# Optional tools are advertised only when their runtime resources exist.
+DEFAULT_LCM_TOOLS = {
     "lcm_grep",
     "lcm_recall",
-    "lcm_query_state",
     "lcm_compute",
     "lcm_compile_evidence",
     "lcm_evidence_pack",
-    "lcm_retrieve",
     "lcm_recent",
     "lcm_load_session",
     "lcm_describe",
@@ -22,6 +23,21 @@ EXPECTED_LCM_TOOLS = {
     "lcm_inspect",
     "lcm_doctor",
 }
+
+
+@pytest.fixture(params=[(False, False), (True, False), (False, True), (True, True)],
+                ids=["default-13", "assertions-14", "adaptive-14", "both-15"])
+def exposed_tools(request, monkeypatch):
+    assertions, adaptive = request.param
+    monkeypatch.setenv("LCM_ASSERTIONS_ENABLED", str(assertions).lower())
+    monkeypatch.setenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", str(adaptive).lower())
+    expected = set(DEFAULT_LCM_TOOLS)
+    assert len(expected) == 13
+    if assertions:
+        expected.add("lcm_query_state")
+    if adaptive:
+        expected.add("lcm_retrieve")
+    return expected
 
 
 def _load_plugin_module(name: str):
@@ -84,7 +100,7 @@ class TestHostCapabilityDetection:
 class TestRegistrationGating:
     """Verify register() skips ctx.register_tool unless messages forwarding is explicit."""
 
-    def test_skips_register_tool_without_explicit_message_forwarding(self):
+    def test_skips_register_tool_without_explicit_message_forwarding(self, exposed_tools):
         module = _load_plugin_module("hermes_lcm_gating_skip")
         registered_tools = []
 
@@ -104,11 +120,12 @@ class TestRegistrationGating:
         assert ctx.engine is not None
         assert ctx.engine.name == "lcm"
         assert registered_tools == []
-        assert EXPECTED_LCM_TOOLS.issubset(
-            {schema["name"] for schema in ctx.engine.get_tool_schemas()}
-        )
+        try:
+            assert {schema["name"] for schema in ctx.engine.get_tool_schemas()} == exposed_tools
+        finally:
+            ctx.engine.shutdown()
 
-    def test_registers_tools_when_host_explicitly_supports_message_forwarding(self):
+    def test_registers_tools_when_host_explicitly_supports_message_forwarding(self, exposed_tools):
         module = _load_plugin_module("hermes_lcm_gating_register")
         registered_tools = []
 
@@ -128,7 +145,11 @@ class TestRegistrationGating:
         module.register(ctx)
 
         assert ctx.engine is not None
-        assert set(registered_tools) == EXPECTED_LCM_TOOLS
+        try:
+            assert set(registered_tools) == exposed_tools
+            assert {schema["name"] for schema in ctx.engine.get_tool_schemas()} == exposed_tools
+        finally:
+            ctx.engine.shutdown()
 
     def test_existing_context_engine_path_still_loads_without_register_tool(self):
         module = _load_plugin_module("hermes_lcm_gating_no_register_tool")
@@ -149,7 +170,7 @@ class TestRegistrationGating:
 class TestHermesAgentRegression:
     """Regression: Hermes Agent-shaped hosts must not shadow native LCM routing."""
 
-    def test_hermes_agent_shaped_host_uses_context_engine_path(self):
+    def test_hermes_agent_shaped_host_uses_context_engine_path(self, exposed_tools):
         module = _load_plugin_module("hermes_lcm_hermes_agent_regression")
         registered_via_tool = []
         registered_via_engine = []
@@ -172,7 +193,10 @@ class TestHermesAgentRegression:
 
         assert ctx.engine is not None
         assert registered_via_tool == []
-        assert set(registered_via_engine) == EXPECTED_LCM_TOOLS
+        try:
+            assert set(registered_via_engine) == exposed_tools
+        finally:
+            ctx.engine.shutdown()
 
     def test_messages_forwarded_through_context_engine_path(self):
         module = _load_plugin_module("hermes_lcm_messages_forward_regression")

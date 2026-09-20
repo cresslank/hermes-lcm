@@ -1795,7 +1795,16 @@ def test_import_lossless_claw_externalizes_legacy_data_uri_content(tmp_path):
     )
     engine.on_session_start("openclaw-lcm:agent:repro:legacy-session", platform="import", context_length=200_000)
     expanded = _expand_ref(engine, ref)
-    assert expanded["content"] == "legacy " + DATA_URI
+    # Ingest protection externalizes the URI substring, not its text prefix.
+    # Verify the entire imported message is still exactly reconstructible.
+    from hermes_lcm.ingest_protection import restore_ingest_payload_placeholders
+    assert expanded["content"] == DATA_URI
+    assert content.startswith("legacy ")
+    assert restore_ingest_payload_placeholders(
+        content, config=engine._config, hermes_home=str(tmp_path),
+        session_id="openclaw-lcm:agent:repro:legacy-session",
+    ) == "legacy " + DATA_URI
+    engine.shutdown()
 
 
 def test_import_lossless_claw_respects_externalization_path_env(tmp_path, monkeypatch):
@@ -1829,7 +1838,16 @@ def test_import_lossless_claw_respects_externalization_path_env(tmp_path, monkey
     )
     engine.on_session_start("openclaw-lcm:agent:repro:legacy-session", platform="import", context_length=200_000)
     expanded = _expand_ref(engine, ref)
-    assert expanded["content"] == "legacy " + DATA_URI
+    # Ingest protection externalizes the URI substring, not its text prefix.
+    # Verify the entire imported message is still exactly reconstructible.
+    from hermes_lcm.ingest_protection import restore_ingest_payload_placeholders
+    assert expanded["content"] == DATA_URI
+    assert content.startswith("legacy ")
+    assert restore_ingest_payload_placeholders(
+        content, config=engine._config, hermes_home=str(tmp_path),
+        session_id="openclaw-lcm:agent:repro:legacy-session",
+    ) == "legacy " + DATA_URI
+    engine.shutdown()
 
 
 def test_store_id_expand_never_returns_raw_historical_tool_calls(tmp_path):

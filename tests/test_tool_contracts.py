@@ -1,15 +1,14 @@
 """Public lcm_* tool contract drift guards."""
 
-import ast
 import importlib
-import inspect
+import json
 import sys
-import textwrap
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 import hermes_lcm.schemas as schemas
-import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
 
 
@@ -85,8 +84,9 @@ def _schema_by_tool_name() -> dict[str, dict]:
     return public_schemas
 
 
-def _engine_tool_schemas(tmp_path) -> list[dict]:
-    config = LCMConfig(database_path=str(tmp_path / "contract.db"))
+def _engine_tool_schemas(tmp_path, assertions=False, adaptive=False) -> list[dict]:
+    config = LCMConfig(database_path=str(tmp_path / "contract.db"),
+                       assertions_enabled=assertions, adaptive_retrieval_enabled=adaptive)
     engine = LCMEngine(config=config)
     try:
         return engine.get_tool_schemas()
@@ -95,24 +95,18 @@ def _engine_tool_schemas(tmp_path) -> list[dict]:
 
 
 def _dispatch_tool_names() -> list[str]:
-    source = textwrap.dedent(inspect.getsource(LCMEngine.handle_tool_call))
-    tree = ast.parse(source)
+    # Dispatch is descriptor-driven, not a second hard-coded handlers dict.
+    descriptors = LCMEngine.handle_tool_call.__globals__["TOOLS_BY_NAME"]
+    return list(descriptors)
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(isinstance(target, ast.Name) and target.id == "handlers" for target in node.targets):
-            continue
-        if not isinstance(node.value, ast.Dict):
-            raise AssertionError("handle_tool_call handlers must be a dict literal")
-        tool_names = []
-        for key in node.value.keys:
-            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-                raise AssertionError("handle_tool_call handler keys must be string literals")
-            tool_names.append(key.value)
-        return tool_names
 
-    raise AssertionError("handle_tool_call must define a handlers dispatch map")
+def _enabled_tool_names(manifest_tools, assertions, adaptive):
+    disabled = set()
+    if not assertions:
+        disabled.add("lcm_query_state")
+    if not adaptive:
+        disabled.add("lcm_retrieve")
+    return [name for name in manifest_tools if name not in disabled]
 
 
 def _assert_unique(surface: str, tool_names: list[str]) -> None:
@@ -120,10 +114,11 @@ def _assert_unique(surface: str, tool_names: list[str]) -> None:
     assert duplicates == [], f"duplicate tools in {surface}: {duplicates}"
 
 
-def test_public_tool_names_are_synchronized_across_contract_surfaces(tmp_path):
+@pytest.mark.parametrize("assertions,adaptive", [(False, False), (True, False), (False, True), (True, True)])
+def test_public_tool_names_are_synchronized_across_contract_surfaces(tmp_path, assertions, adaptive):
     manifest_tools = _manifest_tool_names()
     schema_by_name = _schema_by_tool_name()
-    engine_schemas = _engine_tool_schemas(tmp_path)
+    engine_schemas = _engine_tool_schemas(tmp_path, assertions, adaptive)
     engine_tools = [schema["name"] for schema in engine_schemas]
     dispatch_tools = _dispatch_tool_names()
 
@@ -132,17 +127,23 @@ def test_public_tool_names_are_synchronized_across_contract_surfaces(tmp_path):
     _assert_unique("LCMEngine.get_tool_schemas", engine_tools)
     _assert_unique("LCMEngine.handle_tool_call", dispatch_tools)
 
-    assert manifest_tools == engine_tools
+    assert _enabled_tool_names(manifest_tools, assertions, adaptive) == engine_tools
+    assert len(engine_tools) == 13 + int(assertions) + int(adaptive)
     assert manifest_tools == dispatch_tools
     assert set(manifest_tools) == set(schema_by_name)
 
     engine_schema_by_name = {schema["name"]: schema for schema in engine_schemas}
-    assert engine_schema_by_name == {name: schema_by_name[name] for name in manifest_tools}
+    assert engine_schema_by_name == {name: schema_by_name[name] for name in engine_tools}
 
 
-def test_engine_dispatch_handles_every_declared_public_tool(tmp_path, monkeypatch):
+@pytest.mark.parametrize("assertions,adaptive", [(False, False), (True, False), (False, True), (True, True)])
+def test_engine_dispatch_handles_every_declared_public_tool(tmp_path, monkeypatch, assertions, adaptive):
+    # Resolve the same current package attribute as the lazy descriptor handler;
+    # earlier import-isolation tests may replace the package's tools module.
+    from hermes_lcm import tools as lcm_tools
     manifest_tools = _manifest_tool_names()
-    config = LCMConfig(database_path=str(tmp_path / "dispatch.db"))
+    config = LCMConfig(database_path=str(tmp_path / "dispatch.db"),
+                       assertions_enabled=assertions, adaptive_retrieval_enabled=adaptive)
     engine = LCMEngine(config=config)
     calls = []
 
@@ -157,10 +158,18 @@ def test_engine_dispatch_handles_every_declared_public_tool(tmp_path, monkeypatc
         monkeypatch.setattr(lcm_tools, tool_name, make_fake_handler(tool_name))
 
     try:
+        enabled = _enabled_tool_names(manifest_tools, assertions, adaptive)
         for tool_name in manifest_tools:
             args = {"sentinel": tool_name}
-            assert engine.handle_tool_call(tool_name, args) == f"handled:{tool_name}"
-            assert calls[-1] == (tool_name, args, engine)
+            before = len(calls)
+            result = engine.handle_tool_call(tool_name, args)
+            if tool_name in enabled:
+                assert result == f"handled:{tool_name}"
+                assert calls[-1] == (tool_name, args, engine)
+                assert len(calls) == before + 1
+            else:
+                assert json.loads(result)["status"] == "disabled"
+                assert len(calls) == before
 
         unknown = engine.handle_tool_call("lcm_missing", {})
         assert "Unknown LCM tool: lcm_missing" in unknown
