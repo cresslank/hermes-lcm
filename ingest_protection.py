@@ -1732,7 +1732,462 @@ def _extract_source_text_externalized_payload_refs(
     return refs
 
 
-def _refs_from_terminal_source_listing(value: Any) -> list[str] | None:
+def _parse_diagnostic_json(text: str) -> Any:
+    """Reject ambiguous envelopes rather than discard duplicate source fields."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate diagnostic key")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError("non-JSON diagnostic constant")
+
+    if not isinstance(text, str) or len(text) > 2_000_000:
+        return None
+    try:
+        return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
+def _diagnostic_source_line_refs(text: str, source_lines: set[int]) -> list[str]:
+    """Mask string literals only on independently identified source lines.
+
+    Decode tool envelopes before calling this: scanning their JSON serialization
+    can join split fixture strings across escaped newlines. This is diagnostic
+    provenance, NOT the extraction/ownership policy used by ingest or readback.
+    """
+    quoted = re.compile(r'''(?<![\w\\])(?:[rRuUbBfF]{0,2})(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''')
+    refs: list[str] = []
+    for index, line in enumerate(text.splitlines()):
+        if index in source_lines:
+            line = quoted.sub(lambda match: " " * len(match.group()), line)
+        _append_unique_refs(refs, extract_all_externalized_payload_refs(line))
+    return refs
+
+
+def _diagnostic_diff_source_lines(lines: list[str]) -> set[int]:
+    """Recognize complete unified-diff hunks, not arbitrary +/- output."""
+    source_lines: set[int] = set()
+    has_headers = False
+    for index, line in enumerate(lines):
+        if line.startswith("--- "):
+            has_headers = index + 1 < len(lines) and lines[index + 1].startswith("+++ ")
+        hunk = re.match(r"^@@ -\d{1,9}(?:,(\d{1,9}))? \+\d{1,9}(?:,(\d{1,9}))? @@(?:.*)$", line)
+        if not has_headers or hunk is None:
+            continue
+        old, new = (int(count) if count is not None else 1 for count in hunk.groups())
+        candidates: set[int] = set()
+        cursor = index + 1
+        while (old or new) and cursor < len(lines):
+            body = lines[cursor]
+            if body == "\\ No newline at end of file":
+                cursor += 1
+                continue
+            if not body or body[0] not in " +-":
+                break
+            old -= body[0] in " -"
+            new -= body[0] in " +"
+            if old < 0 or new < 0:
+                break
+            candidates.add(cursor)
+            cursor += 1
+        if old == new == 0:
+            source_lines.update(candidates)
+    return source_lines
+
+
+def _diagnostic_rtk_diff_source_lines(lines: list[str]) -> set[int]:
+    """Accept RTK compact hunks only behind its stats/Changes/footer wrapper.
+
+    Unlike a raw incomplete diff, an explicit additions-omitted sentinel can
+    close a hunk, but only when it accounts for exactly its missing additions.
+    Paths come from the diffstat, never from a filename/extension allowlist.
+    """
+    if len(lines) > 20_000:
+        return set()
+    footer = "[full diff: rtk git diff --no-compact]"
+    try:
+        end = lines.index(footer)
+        changes = lines.index("Changes:", 0, end)
+    except ValueError:
+        return set()
+    preamble = [line for line in lines[:changes] if line.strip()]
+    if len(preamble) < 2:
+        return set()
+    summary = re.fullmatch(
+        r"\s*(\d{1,9}) files? changed(?:, \d{1,9} insertions?\(\+\))?(?:, \d{1,9} deletions?\(-\))?", preamble[-1],
+    )
+    stats = [re.fullmatch(r"\s*(\S.*?)\s+\|\s+\d{1,9}(?:\s+[+-]+)?\s*", line) for line in preamble[:-1]]
+    if summary is None or not all(stats) or int(summary[1]) != len(stats):
+        return set()
+    paths = {match[1].rstrip() for match in stats if match is not None}
+    if len(paths) != len(stats):
+        return set()
+    source_lines: set[int] = set()
+    active_path = False
+    cursor = changes + 1
+    while cursor < end:
+        line = lines[cursor]
+        if line in paths:
+            active_path = True
+            cursor += 1
+            continue
+        hunk = re.fullmatch(r"@@ -\d{1,9},(\d{1,9}) \+\d{1,9},(\d{1,9}) @@(?:.*)", line)
+        if not active_path or hunk is None:
+            # Blank separators and per-file counts do not grant source status.
+            if line.strip() and re.fullmatch(r"  \+\d{1,9} -\d{1,9}", line) is None:
+                active_path = False
+            cursor += 1
+            continue
+        old, new = map(int, hunk.groups())
+        candidates: set[int] = set()
+        cursor += 1
+        while (old or new) and cursor < end:
+            body = lines[cursor]
+            omission = re.fullmatch(r"  \.\.\. \((\d{1,9}) additions? truncated\)", body)
+            if omission is not None:
+                # RTK also omits trailing unchanged context. The remaining
+                # old/new counts must differ by exactly the stated additions.
+                if old >= 0 and new - old == int(omission[1]) and new > old:
+                    old = new = 0
+                    cursor += 1
+                break
+            if body == "\\ No newline at end of file":
+                cursor += 1
+                continue
+            if not body or body[0] not in " +-" or re.fullmatch(r"  \+\d{1,9} -\d{1,9}", body):
+                break
+            old -= body[0] in " -"
+            new -= body[0] in " +"
+            if old < 0 or new < 0:
+                break
+            candidates.add(cursor)
+            cursor += 1
+        if old == new == 0:
+            source_lines.update(candidates)
+        else:
+            active_path = False
+    return source_lines
+
+
+def _diagnostic_plain_refs(value: Any) -> list[str]:
+    """Scan non-source fields as data, including nested diagnostic messages."""
+    refs: list[str] = []
+    for text in _walk_string_values(value):
+        _append_unique_refs(refs, extract_all_externalized_payload_refs(text))
+    return refs
+
+
+def _refs_from_patch_result(value: Any) -> list[str] | None:
+    required = {"success", "diff", "files_modified"}
+    allowed = required | {"resolved_path", "lint", "_warning", "error"}
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
+        return None
+    if value["success"] is not True or not isinstance(value["diff"], str):
+        return None
+    if not isinstance(value["files_modified"], list) or not all(isinstance(path, str) for path in value["files_modified"]):
+        return None
+    if any(key in value and not isinstance(value[key], str) for key in ("resolved_path", "_warning")):
+        return None
+    if value.get("error") is not None and not isinstance(value["error"], str):
+        return None
+    lint = value.get("lint")
+    if lint is not None and (
+        not isinstance(lint, dict) or set(lint) != {"status", "output"}
+        or not all(isinstance(item, str) for item in lint.values())
+    ):
+        return None
+    refs = _diagnostic_source_line_refs(
+        value["diff"], _diagnostic_diff_source_lines(value["diff"].splitlines()),
+    )
+    _append_unique_refs(refs, _diagnostic_plain_refs({key: item for key, item in value.items() if key != "diff"}))
+    return refs
+
+
+def _refs_from_read_file_result(value: Any) -> list[str] | None:
+    required = {"content", "total_lines", "file_size", "truncated", "is_binary", "is_image"}
+    allowed = required | {"hint", "next_offset", "error"}
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
+        return None
+    if not isinstance(value["content"], str) or type(value["truncated"]) is not bool:
+        return None
+    if value["is_binary"] is not False or value["is_image"] is not False:
+        return None
+    if any(type(value[key]) is not int or value[key] < 0 for key in ("total_lines", "file_size")):
+        return None
+    if "next_offset" in value and (type(value["next_offset"]) is not int or value["next_offset"] < 1):
+        return None
+    if any(key in value and value[key] is not None and not isinstance(value[key], str) for key in ("hint", "error")):
+        return None
+    source_lines = {index for index, line in enumerate(value["content"].splitlines()) if re.match(r"^\d+\|", line)}
+    refs = _diagnostic_source_line_refs(value["content"], source_lines)
+    _append_unique_refs(refs, _diagnostic_plain_refs({key: item for key, item in value.items() if key != "content"}))
+    return refs
+
+
+def _refs_from_diagnostic_excerpt_row(value: Any, *, depth: int) -> list[str] | None:
+    """Metadata is not source provenance for truncated head/tail excerpts.
+
+    Only an excerpt covering the entire original field can delegate to the
+    ordinary exact-envelope parser. Never join head and tail or guess missing
+    JSON, diff headers, or duplicate/unknown fields from a partial patch reply.
+    """
+    fields = {"store_id", "role", "source", "tool_name", "content_len", "content_head", "content_tail"}
+    if not isinstance(value, dict) or set(value) != fields:
+        return None
+    if (
+        type(value["store_id"]) is not int or type(value["content_len"]) is not int
+        or value["content_len"] < 0
+        or not all(isinstance(value[key], str) for key in fields - {"store_id", "content_len"})
+        or any(len(value[key]) > value["content_len"] for key in ("content_head", "content_tail"))
+    ):
+        return None
+    refs = _diagnostic_plain_refs({key: item for key, item in value.items() if key not in {"content_head", "content_tail"}})
+    for key in ("content_head", "content_tail"):
+        excerpt = value[key]
+        if len(excerpt) == value["content_len"]:
+            nested = _refs_for_externalized_integrity_scan(
+                excerpt, role=value["role"], field="content",
+                tool_name=value["tool_name"], _depth=depth + 1,
+            )
+        else:
+            nested = _diagnostic_plain_refs(excerpt)
+        _append_unique_refs(refs, nested)
+    return refs
+
+
+def _parse_diagnostic_repr(text: str) -> str | None:
+    """Read one bounded, canonical Python repr string; never evaluate code."""
+    if not text or len(text) > 2_000_000 or text[0] not in "\"'":
+        return None
+    import ast
+
+    try:
+        node = ast.parse(text, mode="eval").body
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str) and repr(node.value) == text:
+        return node.value
+    return None
+
+
+def _refs_from_diagnostic_source_slice(text: str) -> list[str]:
+    """Scan repr-decoded slices without pretending a partial JSON is complete.
+
+    Only direct numbered lines or *complete* JSON-escaped numbered lines have
+    local source provenance. Decode at most one JSON layer. All fragments and
+    unnumbered text, including ordinary quoted owners, keep the plain scan.
+    """
+    if is_externalized_ingest_placeholder(text.strip()) or is_externalized_placeholder(text.strip()):
+        return extract_all_externalized_payload_refs(text)
+    refs: list[str] = []
+    pieces: list[str] = []
+    cursor = 0
+    source_spans: list[tuple[int, int]] = []
+    # An odd preceding slash can mean an escaped backslash, not a JSON newline;
+    # do not attempt to recover that ambiguous boundary.
+    boundary = re.compile(r"(?<!\\)\\n")
+    breaks = list(boundary.finditer(text))
+    for left, right in zip(breaks, breaks[1:]):
+        raw = text[left.end():right.start()]
+        if re.match(r"^[ \t]*\d{1,9}:[ \t]+", raw) is None:
+            continue
+        decoded = _parse_diagnostic_json('"' + raw + '"')
+        if not isinstance(decoded, str) or "\n" in decoded or "\r" in decoded:
+            continue
+        pieces.extend((text[cursor:left.end()], " " * len(raw)))
+        cursor = right.start()
+        source_spans.append((left.end(), right.start()))
+        _append_unique_refs(refs, _diagnostic_source_line_refs(decoded, {0}))
+    pieces.append(text[cursor:])
+    remainder = "".join(pieces)
+    numbered = {index for index, line in enumerate(remainder.splitlines()) if re.match(r"^[ \t]*\d{1,9}:[ \t]+", line)}
+    _append_unique_refs(refs, _diagnostic_source_line_refs(remainder, numbered))
+    # Keep matches crossing between source and unknown text. A match entirely
+    # spanning numbered lines is scanned *after* decoding above, not across
+    # escaped newlines that could accidentally join split fixture literals.
+    from bisect import bisect_right
+
+    starts = [start for start, _ in source_spans]
+    for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
+        for match in pattern.finditer(text):
+            left = bisect_right(starts, match.start()) - 1
+            right = bisect_right(starts, match.end() - 1) - 1
+            starts_in_source = left >= 0 and match.start() < source_spans[left][1]
+            ends_in_source = right >= 0 and match.end() <= source_spans[right][1]
+            overlaps = starts_in_source or right > left
+            if overlaps and not (starts_in_source and ends_in_source):
+                _append_unique_refs(refs, extract_all_externalized_payload_refs(match.group()))
+    return refs
+
+
+def _refs_from_diagnostic_patch_arguments(text: str) -> list[str] | None:
+    """Recognize a full replace-arguments object, not a fragment or call list."""
+    value = _parse_diagnostic_json(text)
+    if (
+        not isinstance(value, dict) or set(value) != {"mode", "path", "old_string", "new_string"}
+        or value["mode"] != "replace" or not all(isinstance(item, str) for item in value.values())
+    ):
+        return None
+    refs = _diagnostic_plain_refs(value["path"])
+    for key in ("old_string", "new_string"):
+        _append_unique_refs(refs, _diagnostic_source_line_refs(value[key], set(range(len(value[key].splitlines())))))
+    return refs
+
+
+def _refs_from_diagnostic_repr_rows(text: str, *, depth: int) -> dict[int, list[str]]:
+    """Authorize repr decoding only beneath exact ROW/PATH diagnostic headers."""
+    if depth >= 8 or len(text) > 2_000_000:
+        return {}
+    recognized: dict[int, list[str]] = {}
+    mode = ""
+    field_len = 0
+    for index, line in enumerate(text.splitlines()):
+        if re.fullmatch(r"ROW \d{1,18} role (?:tool tool terminal|assistant tool None)", line):
+            mode = "slice"
+            continue
+        row = re.fullmatch(r"ROW \d{1,18} (content|tool_calls)", line)
+        if row:
+            mode = row[1]
+            continue
+        path = re.fullmatch(r"PATH (\$\.output|\$\[0\]\.function\.arguments) len (\d{1,9})", line)
+        if path and ((mode == "content" and path[1] == "$.output") or (mode == "tool_calls" and path[1] == "$[0].function.arguments")):
+            mode = "output" if mode == "content" else "arguments"
+            field_len = int(path[2])
+            continue
+        decoded = _parse_diagnostic_repr(line) if mode in {"slice", "output", "arguments"} else None
+        if decoded is None:
+            if line.strip():
+                mode = ""
+            continue
+        if mode == "arguments":
+            refs = _refs_from_diagnostic_patch_arguments(decoded) if len(decoded) == field_len else None
+            # This PATH names one complete arguments field, not a sequence.
+            mode = ""
+            if refs is not None:
+                recognized[index] = refs
+        elif mode == "slice" or len(decoded) <= field_len:
+            # When the slice is a complete object, its entire schema (including
+            # duplicate and unknown keys) is available: do not bypass it with
+            # the partial numbered-line recognizer. A malformed closed object
+            # is likewise not partial-source evidence.
+            stripped = decoded.strip()
+            if stripped.startswith(("{", "[")) and stripped.endswith(("}", "]")):
+                refs = _refs_from_diagnostic_echo(_parse_diagnostic_json(decoded), depth=depth + 1)
+                recognized[index] = refs if refs is not None else _diagnostic_plain_refs(decoded)
+            else:
+                recognized[index] = _refs_from_diagnostic_source_slice(decoded)
+    return recognized
+
+
+def _refs_from_diagnostic_echo(value: Any, *, depth: int) -> list[str] | None:
+    """Recurse only through complete, recognized source/diagnostic envelopes.
+
+    Unknown keys, truncated JSON, and excessive nesting retain the generic
+    fail-closed scan. In particular, a quoted string alone is not provenance.
+    """
+    if depth >= 8:
+        return None
+    if isinstance(value, str):
+        parsed = _parse_diagnostic_json(value)
+        return _refs_from_diagnostic_echo(parsed, depth=depth + 1) if parsed is not None else None
+    if isinstance(value, list):
+        if len(value) > 4096:
+            return None
+        combined: list[str] = []
+        for item in value:
+            nested = _refs_from_diagnostic_excerpt_row(item, depth=depth + 1)
+            if nested is None:
+                nested = _refs_from_diagnostic_echo(item, depth=depth + 1)
+            if nested is None:
+                return None
+            _append_unique_refs(combined, nested)
+        return combined
+    if _is_lcm_expand_result(value):
+        return _refs_for_externalized_integrity_scan(
+            json.dumps(value), role="tool", field="content",
+            tool_name="lcm_expand", _depth=depth + 1,
+        )
+    for parser in (_refs_from_patch_result, _refs_from_read_file_result):
+        refs = parser(value)
+        if refs is not None:
+            return refs
+    refs = _refs_from_terminal_source_listing(value, depth=depth + 1)
+    if refs is not None:
+        return refs
+    if _is_code_search_result(value):
+        return []
+    # Bounded metadata-only diagnostic rows (not arbitrary content wrappers).
+    if isinstance(value, dict) and {"store_id", "role", "content"}.issubset(value):
+        allowed = {"store_id", "session_id", "source", "role", "tool_name", "content", "tool_calls"}
+        if (
+            set(value).issubset(allowed)
+            and type(value["store_id"]) is int
+            and isinstance(value["role"], str)
+            and isinstance(value["content"], str)
+            and all(item is None or isinstance(item, str) for key, item in value.items() if key != "store_id")
+        ):
+            refs = None
+            if value["role"] == "tool" and not value.get("tool_name"):
+                refs = _refs_from_diagnostic_echo(_parse_diagnostic_json(value["content"]), depth=depth + 1)
+            if refs is None:
+                refs = _refs_for_externalized_integrity_scan(
+                    value["content"], role=value["role"], field="content",
+                    tool_name=value.get("tool_name") or "", _depth=depth + 1,
+                )
+            _append_unique_refs(refs, _refs_for_externalized_integrity_scan(
+                value.get("tool_calls") or "", role=value["role"], field="tool_calls", _depth=depth + 1,
+            ))
+            _append_unique_refs(refs, _diagnostic_plain_refs({
+                key: item for key, item in value.items() if key not in {"content", "tool_calls"}
+            }))
+            return refs
+    return None
+
+
+def _refs_from_diagnostic_terminal_output(text: str, *, depth: int) -> list[str]:
+    nested = _refs_from_diagnostic_echo(_parse_diagnostic_json(text), depth=depth)
+    if nested is not None:
+        return nested
+    lines = text.splitlines()
+    source_lines = _diagnostic_diff_source_lines(lines)
+    source_lines.update(_diagnostic_rtk_diff_source_lines(lines))
+    repr_rows = _refs_from_diagnostic_repr_rows(text, depth=depth)
+    in_failures = False
+    in_test_source = False
+    for index, line in enumerate(lines):
+        if re.match(r"^=+ FAILURES =+$", line):
+            in_failures = True
+        elif re.match(r"^=+ .* =+$", line):
+            in_failures = in_test_source = False
+        if in_failures and re.match(r"^    (?:async )?def test_\w+\(", line):
+            in_test_source = True
+        if in_test_source:
+            if line.startswith(("    ", ">   ")):
+                source_lines.add(index)
+            elif line.strip():
+                in_test_source = False
+        if re.match(r"^\s*\d+:\s+", line):
+            source_lines.add(index)
+    refs: list[str] = []
+    for index, line in enumerate(lines):
+        if index in repr_rows:
+            _append_unique_refs(refs, repr_rows[index])
+            continue
+        if index not in source_lines:
+            nested = _refs_from_diagnostic_echo(_parse_diagnostic_json(line), depth=depth)
+            if nested is not None:
+                _append_unique_refs(refs, nested)
+                continue
+        _append_unique_refs(refs, _diagnostic_source_line_refs(line, {0} if index in source_lines else set()))
+    return refs
+
+
+def _refs_from_terminal_source_listing(value: Any, *, depth: int = 0) -> list[str] | None:
     """Return refs for an exact terminal result shape, or None when uncertain."""
     if not isinstance(value, dict):
         return None
@@ -1749,10 +2204,7 @@ def _refs_from_terminal_source_listing(value: Any) -> list[str] | None:
     if "approval" in value and not isinstance(value["approval"], str):
         return None
 
-    refs = _extract_source_text_externalized_payload_refs(
-        value["output"],
-        require_numbered_line=True,
-    )
+    refs = _refs_from_diagnostic_terminal_output(value["output"], depth=depth)
     for key in ("error", "approval"):
         nested = value.get(key)
         if isinstance(nested, str):
@@ -1834,15 +2286,27 @@ def _is_code_search_result(value: Any) -> bool:
 
 
 def _is_lcm_expand_result(value: Any) -> bool:
-    """Return True for a structured raw-message result from ``lcm_expand``."""
+    """Recognize raw-message recall metadata without trusting provider extensions."""
+    string_keys = {
+        "source_type", "role", "content", "session_id", "source", "conversation_id",
+        "tool_call_id", "tool_name", "exact_ref", "externalized_ref", "externalized_note",
+    }
+    integer_keys = {"store_id", "content_chars", "content_offset", "content_returned_chars", "next_content_offset"}
+    boolean_keys = {"from_current_session", "content_truncated", "has_more"}
+    allowed = string_keys | integer_keys | boolean_keys | {"timestamp", "externalized_refs", "externalized", "externalized_payloads"}
     return (
         isinstance(value, dict)
-        and value.get("source_type") == "raw_message"
-        and isinstance(value.get("store_id"), int)
-        and not isinstance(value.get("store_id"), bool)
-        and isinstance(value.get("role"), str)
-        and isinstance(value.get("content"), str)
+        and {"source_type", "store_id", "role", "content"}.issubset(value)
+        and set(value).issubset(allowed)
+        and value["source_type"] == "raw_message"
+        and all(isinstance(value[key], str) for key in string_keys & value.keys())
+        and all(type(value[key]) is int for key in integer_keys & value.keys())
+        and all(type(value[key]) is bool for key in boolean_keys & value.keys())
+        and ("timestamp" not in value or type(value["timestamp"]) in (int, float))
         and isinstance(value.get("externalized_refs", []), list)
+        and all(isinstance(ref, str) for ref in value.get("externalized_refs", []))
+        and isinstance(value.get("externalized", {}), dict)
+        and isinstance(value.get("externalized_payloads", []), list)
     )
 
 
@@ -1852,6 +2316,7 @@ def _refs_for_externalized_integrity_scan(
     role: str,
     field: str,
     tool_name: str = "",
+    _depth: int = 0,
 ) -> list[str]:
     """Return refs that plausibly came from LCM storage-boundary placeholders.
 
@@ -1905,9 +2370,14 @@ def _refs_for_externalized_integrity_scan(
                 _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
     if role == "tool":
-        parsed = _maybe_parse_json_string(value)
-        if field == "content" and tool_name == "terminal":
-            terminal_refs = _refs_from_terminal_source_listing(parsed)
+        parsed = _parse_diagnostic_json(value)
+        if field == "content" and _depth < 8 and tool_name in {"patch", "read_file"}:
+            source_parser = _refs_from_patch_result if tool_name == "patch" else _refs_from_read_file_result
+            source_refs = source_parser(parsed)
+            if source_refs is not None:
+                return source_refs
+        if field == "content" and tool_name == "terminal" and _depth < 8:
+            terminal_refs = _refs_from_terminal_source_listing(parsed, depth=_depth + 1)
             if terminal_refs is not None:
                 return terminal_refs
         if (
@@ -1919,20 +2389,28 @@ def _refs_for_externalized_integrity_scan(
         if (
             field == "content"
             and tool_name == "lcm_expand"
+            and _depth < 8
             and _is_lcm_expand_result(parsed)
         ):
             assert isinstance(parsed, dict)
             expanded_content = parsed["content"]
             expanded_role = parsed["role"]
-            if expanded_role == "tool" and _is_code_search_result(
-                _maybe_parse_json_string(expanded_content)
-            ):
-                return []
-            return _refs_for_externalized_integrity_scan(
-                expanded_content,
-                role=expanded_role,
-                field="content",
-            )
+            # lcm_expand does not always carry the original tool name. Infer
+            # only exact known envelopes, never source status from quoting alone.
+            expanded_refs = None
+            if expanded_role == "tool":
+                expanded_refs = _refs_from_diagnostic_echo(
+                    _parse_diagnostic_json(expanded_content), depth=_depth + 1,
+                )
+            if expanded_refs is None:
+                expanded_refs = _refs_for_externalized_integrity_scan(
+                    expanded_content, role=expanded_role, field="content",
+                    tool_name=parsed.get("tool_name") or "", _depth=_depth + 1,
+                )
+            _append_unique_refs(expanded_refs, _diagnostic_plain_refs(
+                {key: item for key, item in parsed.items() if key != "content"},
+            ))
+            return expanded_refs
         refs = _extract_unescaped_externalized_payload_refs(value)
         if parsed is not None:
             for nested in _walk_string_values(parsed):
@@ -1943,6 +2421,92 @@ def _refs_for_externalized_integrity_scan(
                     _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
     return extract_all_externalized_payload_refs(value)
+
+
+def _refs_from_verified_diagnostic_echo(value: str, conn, *, store_id: int) -> list[str] | None:
+    """Resolve exact copied excerpts against their earlier stored source rows.
+
+    Truncation is not itself source provenance. Only matching bytes and row
+    metadata allow replacing an excerpt's guesses with its original field's
+    diagnostic refs. Actual owning refs in that original field remain counted.
+    Unknown, unavailable, edited or future sources retain ordinary scanning.
+    """
+    outer = _parse_diagnostic_json(value)
+    if not isinstance(outer, dict) or not {"output", "exit_code", "error"}.issubset(outer):
+        return None
+    if not set(outer).issubset({"output", "exit_code", "error", "approval"}):
+        return None
+    if not isinstance(outer["output"], str) or type(outer["exit_code"]) is not int:
+        return None
+    if any(outer.get(key) is not None and not isinstance(outer[key], str) for key in ("error", "approval")):
+        return None
+    output = outer["output"]
+    if len(output) > 2_000_000:
+        return None
+    cache: dict[int, Any] = {}
+
+    def original(source_id):
+        if type(source_id) is not int or not 0 < source_id < store_id:
+            return None
+        if source_id not in cache:
+            if len(cache) >= 256:
+                return None
+            cache[source_id] = conn.execute(
+                "SELECT role, source, tool_name, content, tool_calls FROM messages "
+                "WHERE store_id=? AND length(COALESCE(content,'')) <= 2000000 "
+                "AND length(COALESCE(tool_calls,'')) <= 2000000", (source_id,),
+            ).fetchone()
+        return cache[source_id]
+
+    def field_refs(row, field):
+        text = row[3 if field == "content" else 4] or ""
+        return _refs_for_externalized_integrity_scan(
+            text, role=str(row[0] or ""), field=field, tool_name=str(row[2] or ""),
+        )
+
+    refs = _diagnostic_plain_refs({key: item for key, item in outer.items() if key != "output"})
+    parsed = _parse_diagnostic_json(output)
+    if isinstance(parsed, list) and 0 < len(parsed) <= 256:
+        fields = {"store_id", "role", "source", "tool_name", "content_len", "content_head", "content_tail"}
+        for item in parsed:
+            if not isinstance(item, dict) or set(item) != fields:
+                return None
+            if type(item["content_len"]) is not int or not all(isinstance(item[key], str) for key in ("role", "source", "content_head", "content_tail")):
+                return None
+            row = original(item["store_id"])
+            if row is None or tuple(row[:3]) != (item["role"], item["source"], item["tool_name"]):
+                return None
+            text = row[3] or ""
+            # Some diagnostics use a one-based SQL tail offset. Exact substring
+            # membership, not a guessed endpoint repair, establishes the copy.
+            if len(text) != item["content_len"] or not text.startswith(item["content_head"]) or item["content_tail"] not in text:
+                return None
+            _append_unique_refs(refs, field_refs(row, "content"))
+        return refs
+    row = None
+    excerpts = 0
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        header = re.fullmatch(r"ROW (\d{1,18}) role (tool|assistant) tool (terminal|None)", line)
+        if header:
+            if row is not None and not excerpts:
+                return None
+            row = original(int(header[1]))
+            if row is None or row[0] != header[2] or (row[2] or "None") != header[3]:
+                return None
+            excerpts = 0
+            continue
+        excerpt = _parse_diagnostic_repr(line)
+        if row is None or not excerpt:
+            return None
+        matching = [field for field, text in (("content", row[3]), ("tool_calls", row[4])) if isinstance(text, str) and excerpt in text]
+        if not matching:
+            return None
+        for field in matching:
+            _append_unique_refs(refs, field_refs(row, field))
+        excerpts += 1
+    return refs if row is not None and excerpts else None
 
 
 def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
@@ -1972,12 +2536,14 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         for field, value in (("content", content), ("tool_calls", tool_calls)):
             if not isinstance(value, str):
                 continue
-            for ref in _refs_for_externalized_integrity_scan(
-                value,
-                role=str(role or ""),
-                field=field,
-                tool_name=str(tool_name or ""),
-            ):
+            refs = None
+            if field == "content" and role == "tool" and tool_name == "terminal":
+                refs = _refs_from_verified_diagnostic_echo(value, conn, store_id=int(store_id))
+            if refs is None:
+                refs = _refs_for_externalized_integrity_scan(
+                    value, role=str(role or ""), field=field, tool_name=str(tool_name or ""),
+                )
+            for ref in refs:
                 referenced_refs.add(ref)
                 first_location_by_ref.setdefault(
                     ref,

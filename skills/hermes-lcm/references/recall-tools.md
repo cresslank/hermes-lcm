@@ -93,9 +93,12 @@ Use after bounded baseline refs exist. It validates/hydrates exact refs, keeps o
 
 ### `lcm_compute`
 
-Use only over exact cited evidence validated by the compiler for supported date intervals/filters, distinct counts, compatible-unit sums, directed or absolute differences, ordering, and latest-state selection. Invalid spans, mixed units, ambiguity, or unsupported closure fail closed.
+Use only over exact cited evidence validated by the compiler for supported date intervals/filters, distinct counts, compatible-unit sums, directed or absolute differences, ordering, and latest-state selection. Invalid spans, mixed units, or ambiguity fail closed. Fixed-operand operations remain `computed`; open-cardinality operations return `subset_computed`, explicitly scoped to selected evidence, never a historical total. The legacy `evidence_complete` flag cannot certify coverage. Use the compiler's product-verified finite-coverage computation for exhaustive claims.
 
 ## Default-off advanced paths
+
+Disabled tools are omitted from both advertised schema paths. Direct calls still
+return a bounded `disabled` diagnostic with the enablement flag, without ingest.
 
 - `lcm_query_state` queries the same-database assertion sidecar when that feature is enabled.
 - `lcm_retrieve` is the default-off bounded adaptive controller. It is not required for ordinary recall and must not replace the stable workflow above without measured benefit.

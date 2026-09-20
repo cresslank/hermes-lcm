@@ -123,11 +123,11 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes all 15 schemas: `lcm_grep`, `lcm_recall`,
-  `lcm_query_state`, `lcm_compute`, `lcm_compile_evidence`,
-  `lcm_evidence_pack`, `lcm_retrieve`, `lcm_recent`, `lcm_load_session`,
-  `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
-  and `lcm_doctor`
+- default tool list includes 13 schemas: `lcm_grep`, `lcm_recall`,
+  `lcm_compute`, `lcm_compile_evidence`, `lcm_evidence_pack`, `lcm_recent`,
+  `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`,
+  `lcm_status`, `lcm_inspect`, and `lcm_doctor`; `lcm_query_state` and
+  `lcm_retrieve` appear only when their runtime features are enabled
 - ordinary skill discovery includes `hermes-lcm`; plugin-qualified explicit
   loading is `hermes-lcm:hermes-lcm` on hosts that support plugin skills
 
@@ -135,7 +135,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v1.0.0-rc.1 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.1 (13 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -306,18 +306,39 @@ set it to `wal`) before restarting.
 
 ### Evidence and adaptive retrieval (0.21 RC)
 
-Hermes exposes all 15 LCM tool schemas whenever LCM is the active context
-engine. Exposure is not activation. On a stock install:
+Hermes exposes 13 LCM tool schemas on a stock install. The assertion and
+adaptive-retrieval tools are advertised only when their runtime resources are
+enabled; plugin registration and context-engine dispatch use the same descriptor
+and eligibility boundary. On a stock install:
 
 - `lcm_compute`, `lcm_compile_evidence`, and `lcm_evidence_pack` are bounded,
   provider-neutral operations over caller-supplied exact refs. Calling them does
   not enable a store, run an extractor, or activate an answering model.
-- `lcm_query_state` returns `status: disabled` until
-  `LCM_ASSERTIONS_ENABLED=true` creates/binds the rebuildable assertion sidecar.
-- `lcm_retrieve` returns `status: disabled` until
+- `lcm_query_state` is hidden until `LCM_ASSERTIONS_ENABLED=true` creates/binds
+  the rebuildable assertion sidecar. Direct diagnostic calls return
+  `status: disabled` and the enablement setting without ingesting messages.
+- `lcm_retrieve` is hidden (direct diagnostic calls return `status: disabled`) until
   `LCM_ADAPTIVE_RETRIEVAL_ENABLED=true`. The controller itself has no model or
   provider client, but retrieval calls it dispatches retain their existing
   embedding-provider behavior.
+
+The public `lcm_compute` tool grounds exact operands but does not certify the
+historical population. Open-cardinality counts, broad sums, ordering, and latest
+state return `subset_computed`, with both the answer and trace explicitly scoped
+to selected evidence. The compatibility `evidence_complete` argument cannot
+upgrade that result, and candidate prose cannot turn a subset into a total.
+Fixed-operand arithmetic (including exact named summands with one-to-one
+name/value validation) remains `computed`. Use `lcm_compile_evidence` auto mode
+for product-verified finite coverage; scan truncation must still fail closed.
+The adaptive controller neither publishes subset computations as complete views
+nor reuses cached finite traces as answers to open-cardinality questions.
+
+Per-turn persistence uses the host-owned hook API. Hosts that omit the active
+engine are supported only through a matching live LCM session/lane binding;
+an unbound prototype or an explicitly selected non-LCM engine cannot authorize
+persistence. Targeted unload disarms captured post-turn callbacks and closes the
+plugin-owned prototype, not host-owned per-agent clones. Hosts without owned
+hook registration do not receive a private-hook fallback.
 
 | Variable | Default | Use |
 |----------|---------|-----|

@@ -10,15 +10,15 @@ import subprocess
 import sys
 import types
 
+from .subprocess_sandbox import run_isolated_python
+
 
 EXPECTED_LCM_TOOLS = {
     "lcm_grep",
     "lcm_recall",
-    "lcm_query_state",
     "lcm_compute",
     "lcm_compile_evidence",
     "lcm_evidence_pack",
-    "lcm_retrieve",
     "lcm_recent",
     "lcm_load_session",
     "lcm_describe",
@@ -591,9 +591,66 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
     assert first == second
     assert first == {"context": module.get_recall_policy()}
     assert "Hermes-LCM Recall Policy" in first["context"]
-    assert "lcm_recall" in first["context"]
-    assert "lcm_expand_query" in first["context"]
+    assert "do not force a memory-tool call on ordinary questions" in first["context"]
+    assert "lcm_compile_evidence" in first["context"]
+    assert "open or unknown cardinality" in first["context"]
     ctx.engine.shutdown()
+
+
+def test_fresh_process_injects_exact_baseline_only_for_bound_lcm_engine(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    isolated_home = tmp_path / "fresh-process-hermes-home"
+    script = r'''import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+repo_root = Path(sys.argv[1]).resolve()
+os.environ["HERMES_HOME"] = sys.argv[2]
+os.environ["LCM_PREANSWER_EVIDENCE_ENABLED"] = "false"
+spec = importlib.util.spec_from_file_location(
+    "hermes_lcm_fresh_process_probe",
+    str(repo_root / "__init__.py"),
+    submodule_search_locations=[str(repo_root)],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+hooks = {}
+class Ctx:
+    def register_context_engine(self, engine):
+        self.engine = engine
+    def register_hook(self, name, callback):
+        hooks.setdefault(name, []).append(callback)
+
+ctx = Ctx()
+module.register(ctx)
+hook = hooks["pre_llm_call"][0]
+inactive = hook(session_id="not-bound", user_message="ordinary question")
+ctx.engine.on_session_start("fresh-bound-session", platform="cli")
+active = hook(session_id="fresh-bound-session", user_message="ordinary question")
+print(json.dumps({
+    "module_file": str(Path(module.__file__).resolve()),
+    "inactive": inactive,
+    "active": active,
+    "policy": module.get_recall_policy(),
+}))
+ctx.engine.shutdown()
+'''
+    completed = run_isolated_python(
+        script, tmp_path, str(repo_root), str(isolated_home), timeout=30,
+    )
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    policy = (repo_root / "skills/hermes-lcm/references/recall-policy.md").read_text(
+        encoding="utf-8"
+    ).strip()
+    assert Path(payload["module_file"]) == (repo_root / "__init__.py").resolve()
+    assert payload["inactive"] is None
+    assert payload["active"] == {"context": policy}
+    assert payload["policy"] == policy
+    assert "do not force a memory-tool call on ordinary questions" in policy
 
 
 def test_pre_llm_hook_disabled_toolset_is_identical_and_routed_adds_exact_session_evidence(
@@ -1407,6 +1464,9 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1465,6 +1525,9 @@ def test_post_llm_hook_does_not_foreground_match_side_channel_clone(monkeypatch,
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1497,7 +1560,7 @@ def test_post_llm_hook_does_not_foreground_match_side_channel_clone(monkeypatch,
 
     assert active_clone.bound_session_id == "side-channel"
     assert clone_ingests == []
-    assert singleton_ingests == [history]
+    assert singleton_ingests == []
     active_clone.shutdown()
     ctx.engine.shutdown()
 
@@ -1518,6 +1581,9 @@ def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, 
 
             def register_context_engine(self, engine):
                 self.engine = engine
+
+            def register_hook(self, name, callback):
+                manager._hooks.setdefault(name, []).append(callback)
 
         ctx = _CtxNoTool()
         module.register(ctx)
@@ -1556,7 +1622,7 @@ def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, 
             assert singleton_ingests == []
         else:
             assert clone_ingests == []
-            assert singleton_ingests == [history]
+            assert singleton_ingests == []
         assert active_clone.current_session_id == "session-b"
         assert active_clone.current_conversation_id == "agent:main:discord:thread:b:b"
 
@@ -1587,6 +1653,9 @@ def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
 
     ctx = _CtxNoTool()
     module.register(ctx)
@@ -1635,7 +1704,7 @@ def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
     ctx.engine.shutdown()
 
 
-def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatch, tmp_path):
+def test_post_llm_hook_follows_host_bound_legacy_singleton_between_gateway_lanes(monkeypatch, tmp_path):
     module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_singleton_rebind")
     manager = types.SimpleNamespace(_hooks={})
     fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
@@ -1650,6 +1719,9 @@ def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatc
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
 
     ctx = _CtxNoTool()
     module.register(ctx)
@@ -1669,11 +1741,19 @@ def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatc
         )
 
     monkeypatch.setattr(ctx.engine, "ingest", spy_ingest)
+    ctx.engine.on_session_start(
+        "discord-topic-a", platform="discord",
+        conversation_id="agent:main:discord:thread:a:a",
+    )
     hook(
         session_id="discord-topic-a",
         conversation_id="agent:main:discord:thread:a:a",
         platform="discord",
         conversation_history=[{"role": "user", "content": "topic a"}],
+    )
+    ctx.engine.on_session_start(
+        "telegram-dm", platform="telegram",
+        conversation_id="agent:main:telegram:private:1782862480",
     )
     hook(
         session_id="telegram-dm",
@@ -1697,3 +1777,16 @@ def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatc
         ),
     ]
     ctx.engine.shutdown()
+
+def test_fresh_process_scrubs_inherited_database_override(tmp_path, monkeypatch):
+    denied_root = tmp_path / "sacrificial-denied"
+    denied_root.mkdir()
+    denied_db = denied_root / "must-not-exist.db"
+    monkeypatch.setenv("LCM_DATABASE_PATH", str(denied_db))
+    monkeypatch.setenv("LCM_EXTRACTION_OUTPUT_PATH", str(denied_root / "extract"))
+    monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", str(denied_root / "payloads"))
+    monkeypatch.setenv("HERMES_TEST_DENY_SQLITE_ROOTS", os.pathsep.join(filter(None, [
+        os.environ.get("HERMES_TEST_DENY_SQLITE_ROOTS", ""), str(denied_root),
+    ])))
+    test_fresh_process_injects_exact_baseline_only_for_bound_lcm_engine(tmp_path / "child")
+    assert list(denied_root.iterdir()) == []

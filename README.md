@@ -210,7 +210,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v1.0.0-rc.1 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.1 (13 tools)
 
 Provider Plugins:
   Context Engine: lcm

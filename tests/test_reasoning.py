@@ -315,7 +315,7 @@ def test_sum_preserves_large_integers_and_bounds_decimal_overflow(evidence_db):
         },
         engine=engine,
     ))
-    assert exact["status"] == "computed"
+    assert exact["status"] == "subset_computed"
     assert exact["trace"]["result_value"] == 9007199254740994
     assert exact["trace"]["result"] == "9007199254740994 items"
 
@@ -602,7 +602,7 @@ def test_order_projects_requested_ordinal_and_preserves_full_order(evidence_db):
             },
             engine=engine,
         ))
-        assert result["status"] == "computed", (question, result)
+        assert result["status"] == "subset_computed", (question, result)
         assert result["trace"]["result"] == expected
         assert result["trace"]["result_value"] == [expected]
 
@@ -828,8 +828,9 @@ def test_public_compute_tool_requires_closed_cardinality(evidence_db):
         },
         engine=SimpleNamespace(_store=messages, _assertions=assertions),
     ))
-    assert response["status"] == "fallback"
-    assert response["reason"] == "operation requires explicit evidence_complete=true"
+    assert response["status"] == "subset_computed"
+    assert response["evidence_complete"] is False
+    assert response["trace"]["scope"] == "selected_evidence_only"
 
 
 def test_count_distinct_rejects_question_subject_as_canonical_key(evidence_db):
@@ -865,7 +866,7 @@ def test_count_distinct_rejects_question_subject_as_canonical_key(evidence_db):
         "count_distinct canonical keys must identify counted entities, "
         "not the question subject"
     )
-    assert accepted["status"] == "computed"
+    assert accepted["status"] == "subset_computed"
     assert accepted["trace"]["result_value"] == 2
 
 
@@ -916,3 +917,11 @@ def test_named_sum_binds_each_value_to_its_requested_summand(evidence_db):
     assert wrong_labels["status"] == "fallback"
     assert correct["status"] == "computed"
     assert correct["trace"]["result_value"] == 120
+    assert correct["plan"]["exact_operands"] == 2
+    assert correct["plan"]["requires_complete_evidence"] is False
+    omitted = json.loads(lcm_compute({
+        "question": question,
+        "evidence_complete": True,
+        "operands": [_raw(taxi_id, taxi, taxi, value=20, unit="usd", label="Taxi")],
+    }, engine=engine))
+    assert omitted["status"] == "fallback"

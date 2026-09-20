@@ -377,12 +377,12 @@ def lcm_query_state(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
-    store = getattr(engine, "_assertions", None)
-    if store is None:
-        return json.dumps({
-            "status": "disabled",
-            "error": "V4 assertions are not enabled for this profile",
-        })
+    from .tool_descriptors import TOOLS_BY_NAME
+    disabled = TOOLS_BY_NAME["lcm_query_state"].disabled_response(engine)
+    if disabled is not None:
+        return json.dumps(disabled)
+    store = engine._assertions
+    assert store is not None  # descriptor eligibility guarantees the resource
 
     subject_key = str(args.get("subject_key") or "").strip()
     if not subject_key:
@@ -672,27 +672,11 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
     plan = plan_decision.plan
 
     selector_started = time.perf_counter()
-    if plan.requires_complete_evidence and args.get("evidence_complete") is not True:
-        stages["selector"] = _compute_stage(
-            "host_tool_arguments",
-            selector_started,
-            provider="unknown_to_plugin",
-            model="unknown_to_plugin",
-            status="fallback",
-            evidence_complete=False,
-        )
-        return json.dumps({
-            "status": "fallback",
-            "reason": "operation requires explicit evidence_complete=true",
-            "plan": plan.as_dict(),
-            "next_path": "evidence_only",
-            "provenance": {"stages": stages},
-            "metrics": {
-                "total_latency_ms": round(
-                    (time.perf_counter() - total_started) * 1_000.0, 3
-                )
-            },
-        })
+    # Grounding selected operands does not prove historical population coverage.
+    # The compatibility evidence_complete argument is deliberately non-authoritative.
+    # Product-owned finite scans in the compiler/pack may still emit closed traces;
+    # this public selector-only route can return subset arithmetic, never a total.
+    subset_only = plan.requires_complete_evidence
 
     raw_operands = args.get("operands")
     try:
@@ -715,7 +699,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
             provider="unknown_to_plugin",
             model="unknown_to_plugin",
             status="fallback",
-            evidence_complete=bool(args.get("evidence_complete") is True),
+            evidence_complete=not subset_only,
             operand_count=(len(raw_operands) if isinstance(raw_operands, list) else 0),
         )
         return json.dumps({
@@ -738,7 +722,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
             provider="unknown_to_plugin",
             model="unknown_to_plugin",
             status="fallback",
-            evidence_complete=bool(args.get("evidence_complete") is True),
+            evidence_complete=not subset_only,
             operand_count=len(grounding.operands),
         )
         return json.dumps({
@@ -759,7 +743,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         provider="unknown_to_plugin",
         model="unknown_to_plugin",
         status="validated",
-        evidence_complete=bool(args.get("evidence_complete") is True),
+        evidence_complete=not subset_only,
         operand_count=len(grounding.operands),
     )
 
@@ -794,7 +778,12 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
     verification_payload: dict[str, Any]
     answer = trace.answer
     candidate_used = False
-    if candidate_present:
+    if subset_only and candidate_present:
+        verification_payload = {
+            "status": "fallback",
+            "reason": "candidate cannot certify completeness of selected evidence",
+        }
+    elif candidate_present:
         verifier_started = time.perf_counter()
         verification = verify_final_answer(candidate, trace)
         stages["verifier"] = _compute_stage(
@@ -832,10 +821,14 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         "latency_ms": round((time.perf_counter() - final_started) * 1_000.0, 3),
         "candidate_used": candidate_used,
     }
+    trace_payload = trace.as_dict()
+    if subset_only:
+        answer = "Selected evidence only (historical coverage unverified): " + trace.answer
+        trace_payload.update({"answer": answer, "scope": "selected_evidence_only"})
     response = {
-        "status": "computed",
+        "status": "subset_computed" if subset_only else "computed",
         "plan": plan.as_dict(),
-        "trace": trace.as_dict(),
+        "trace": trace_payload,
         "answer": answer,
         "candidate_verification": verification_payload,
         "provenance": {
@@ -851,6 +844,13 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         },
         "response_char_cap": _LCM_COMPUTE_RESPONSE_CHAR_CAP,
     }
+    if subset_only:
+        response.update({
+            "scope": "selected_evidence_only",
+            "evidence_complete": False,
+            "reason": "selected operands do not establish historical population coverage",
+            "next_path": "lcm_compile_evidence",
+        })
     encoded = json.dumps(response, ensure_ascii=False)
     if len(encoded) > _LCM_COMPUTE_RESPONSE_CHAR_CAP:
         return json.dumps({
@@ -936,20 +936,12 @@ def lcm_retrieve(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
-    controller = getattr(engine, "_adaptive_retrieval", None)
-    if controller is None:
-        return json.dumps({
-            "status": "disabled",
-            "reason": "adaptive retrieval is disabled",
-            "enable_with": "LCM_ADAPTIVE_RETRIEVAL_ENABLED=true",
-            "provenance": {
-                "controller": {
-                    "transport": "deterministic_local",
-                    "provider": "none",
-                    "model": "none",
-                }
-            },
-        })
+    from .tool_descriptors import TOOLS_BY_NAME
+    disabled = TOOLS_BY_NAME["lcm_retrieve"].disabled_response(engine)
+    if disabled is not None:
+        return json.dumps(disabled)
+    controller = engine._adaptive_retrieval
+    assert controller is not None  # descriptor eligibility guarantees the resource
     if not isinstance(args, dict):
         return json.dumps({"status": "error", "error": "arguments must be an object"})
     unknown = set(args) - _LCM_RETRIEVE_ARGUMENTS

@@ -468,6 +468,18 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
     ):
         operation = "sum"
         exact = _bounded_sum_count(text)
+        if exact is None:
+            # Explicitly named singular summands are fixed operands, unlike
+            # "combined total" or plural/open classes. Public callers still
+            # validate a one-to-one name/value binding before execution.
+            selectors = _named_sum_selectors(text)
+            open_words = {"all", "every", "each", "any", "other", "remaining"}
+            if selectors and all(
+                not (selector & open_words)
+                and not any(token.endswith("s") for token in selector)
+                for selector in selectors
+            ):
+                exact = len(selectors)
         minimum = exact or 2
         requires_complete = exact is None
     elif re.search(r"\b(how many|count|number of)\b", normalized):

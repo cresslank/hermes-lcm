@@ -21,11 +21,12 @@ from hermes_lcm.engine import LCMEngine
 import hermes_lcm.tools as lcm_tools
 
 
-def _engine(tmp_path, *, enabled=True, name="lcm.db") -> LCMEngine:
+def _engine(tmp_path, *, enabled=True, assertions=False, name="lcm.db") -> LCMEngine:
     engine = LCMEngine(
         config=LCMConfig(
             database_path=str(tmp_path / name),
             adaptive_retrieval_enabled=enabled,
+            assertions_enabled=assertions,
         )
     )
     engine.on_session_start("session-a", conversation_id="conversation-a")
@@ -179,7 +180,7 @@ def test_exact_slot_closure_compute_finish_and_warm_reuse(tmp_path):
         rome_id = _append(engine, "I visited Rome.")
         started = _start(
             engine,
-            question="How many distinct cities did I visit?",
+            question="How many of the two trips did I take?",
             operation="count_distinct",
             minimum_refs=2,
         )
@@ -249,7 +250,7 @@ def test_exact_slot_closure_compute_finish_and_warm_reuse(tmp_path):
         # test_cached_view_is_not_reused_across_different_requirement_descriptions.
         warm = _start(
             engine,
-            question="How many different cities have I visited?",
+            question="Count the two trips I took.",
             operation="count_distinct",
             minimum_refs=2,
         )
@@ -259,6 +260,15 @@ def test_exact_slot_closure_compute_finish_and_warm_reuse(tmp_path):
         assert warm["query_view"]["cached_computation_trace"][
             "result_value"
         ] == 2
+
+        # Same caller identity/slots do not make a finite cached count an
+        # open-world total. Exact evidence can be reused, but not the trace.
+        open_world = _start(
+            engine, question="How many cities have I visited?",
+            operation="count_distinct", minimum_refs=2,
+        )
+        assert open_world["query_view"]["status"] == "hit"
+        assert open_world["query_view"]["cached_computation_trace"] is None
 
         different_cardinality = _start(
             engine,
@@ -635,7 +645,7 @@ def test_profile_rebind_clears_ephemeral_controller_state(tmp_path):
 
 
 def test_candidate_and_context_caps_apply_before_return(monkeypatch, tmp_path):
-    engine = _engine(tmp_path)
+    engine = _engine(tmp_path, assertions=True)
     try:
         content = "x" * 2_400
         store_ids = [_append(engine, content) for _ in range(25)]
@@ -649,6 +659,8 @@ def test_candidate_and_context_caps_apply_before_return(monkeypatch, tmp_path):
             })
 
         monkeypatch.setattr(lcm_tools, "lcm_query_state", many_exact_refs)
+        # The fixture enables assertions: disabled tools correctly stop at
+        # the shared eligibility boundary before this instrumented handler.
         started = _start(engine, minimum_refs=25)
         result = _call(
             engine,

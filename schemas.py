@@ -288,9 +288,11 @@ LCM_COMPUTE = {
         "difference, ordering, or latest-state operation over exact cited LCM evidence. "
         "The operation is inferred from the question; this tool never calls a model. "
         "Supply only exact message spans (or assertion IDs) whose values, units, labels, "
-        "keys, and dates are explicit in the cited evidence. Unsupported, incomplete, "
-        "mixed-unit, conflicting, or unverifiable inputs fail closed to the ordinary "
-        "evidence-only answer path."
+        "keys, and dates are explicit in the cited evidence. Open-cardinality operations "
+        "return subset_computed: arithmetic over selected evidence only, never a complete "
+        "historical total or latest-state claim. Use lcm_compile_evidence auto mode for "
+        "product-verified finite coverage. Fixed-operand arithmetic remains available. "
+        "Unsupported, mixed-unit, conflicting, or unverifiable inputs fail closed."
     ),
     "parameters": {
         "type": "object",
@@ -308,8 +310,8 @@ LCM_COMPUTE = {
             "evidence_complete": {
                 "type": "boolean",
                 "description": (
-                    "Set true only after the current retrieval turn has closed all "
-                    "evidence slots for open-cardinality operations."
+                    "Deprecated compatibility field; ignored as proof of completeness. "
+                    "Open-cardinality results are always labeled selected-evidence subsets."
                 ),
                 "default": False,
             },

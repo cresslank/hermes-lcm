@@ -960,9 +960,13 @@ class AdaptiveRetrievalRegistry:
                             state.context_chars = candidate_chars
                             state.status = "ready"
                             state.view_lookup_status = "hit"
-                            state.cached_trace = lookup.view.get(
-                                "computation_trace"
-                            )
+                            # A cached trace from older code (or a finite-operand
+                            # question sharing this identity) is not open-world
+                            # coverage. Reuse exact evidence, never its total.
+                            from .reasoning import compile_evidence_plan
+                            decision = compile_evidence_plan(text, normalized_date or None)
+                            if decision.plan is not None and not decision.plan.requires_complete_evidence:
+                                state.cached_trace = lookup.view.get("computation_trace")
                         else:
                             valid = False
                             state.view_lookup_status = confirmed.status
@@ -1337,7 +1341,8 @@ class AdaptiveRetrievalRegistry:
                 compute_args = {
                     "question": state.question,
                     "question_date": state.question_date or None,
-                    "evidence_complete": True,
+                    # Resolved caller-declared slots are not population coverage.
+                    # The public compute boundary labels open-cardinality subsets.
                     "operands": operands,
                 }
                 if "candidate_answer" in computation:

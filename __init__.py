@@ -364,23 +364,8 @@ def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
-    from .schemas import (
-        LCM_GREP,
-        LCM_RECALL,
-        LCM_QUERY_STATE,
-        LCM_COMPUTE,
-        LCM_COMPILE_EVIDENCE,
-        LCM_EVIDENCE_PACK,
-        LCM_RETRIEVE,
-        LCM_RECENT,
-        LCM_LOAD_SESSION,
-        LCM_DESCRIBE,
-        LCM_EXPAND,
-        LCM_EXPAND_QUERY,
-        LCM_STATUS,
-        LCM_INSPECT,
-        LCM_DOCTOR,
-    )
+    from .tool_descriptors import eligible_tools
+    import threading
 
     config = LCMConfig.from_env()
 
@@ -394,6 +379,22 @@ def register(ctx):
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
     engine = LCMEngine(config=config, hermes_home=hermes_home)
+
+    # Own only the prototype we created, not per-agent clones owned by Hermes.
+    # Serialize cleanup with persistence so unload cannot return while an old
+    # callback is still writing. Also disarm callbacks captured before unload.
+    persistence_lock = threading.RLock()
+    registration_active = True
+
+    def _on_unload():
+        nonlocal registration_active
+        with persistence_lock:
+            registration_active = False
+            engine.shutdown()
+
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(_on_unload)
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
@@ -477,26 +478,10 @@ def register(ctx):
     # names through the plugin registry (Path A) on message-blind hosts would
     # shadow Path B and lose current-turn ingest, so the Path B fallback is the
     # expected healthy behavior there.
-    _TOOLS = [
-        ("lcm_grep", LCM_GREP, "🔍"),
-        ("lcm_recall", LCM_RECALL, "🧠"),
-        ("lcm_query_state", LCM_QUERY_STATE, "🧾"),
-        ("lcm_compute", LCM_COMPUTE, "🧮"),
-        ("lcm_compile_evidence", LCM_COMPILE_EVIDENCE, "🧷"),
-        ("lcm_evidence_pack", LCM_EVIDENCE_PACK, "📦"),
-        ("lcm_retrieve", LCM_RETRIEVE, "🧭"),
-        ("lcm_recent", LCM_RECENT, "🕒"),
-        ("lcm_load_session", LCM_LOAD_SESSION, "📋"),
-        ("lcm_describe", LCM_DESCRIBE, "📊"),
-        ("lcm_expand", LCM_EXPAND, "🔎"),
-        ("lcm_expand_query", LCM_EXPAND_QUERY, "❓"),
-        ("lcm_status", LCM_STATUS, "💚"),
-        ("lcm_inspect", LCM_INSPECT, "🧭"),
-        ("lcm_doctor", LCM_DOCTOR, "🏥"),
-    ]
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool) and _host_forwards_registered_tool_messages(ctx):
-        for name, schema, emoji in _TOOLS:
+        for descriptor in eligible_tools(engine):
+            name, schema, emoji = descriptor.name, descriptor.schema, descriptor.emoji
             try:
                 register_tool(
                     name=name,
@@ -555,21 +540,20 @@ def register(ctx):
     # receives conversation_history including the assistant response.  The
     # existing _ingest_messages cursor prevents duplicates if compress() runs
     # later the same turn.
-    try:
-        from hermes_cli.plugins import get_plugin_manager as _get_pm
-        _mgr = _get_pm()
-
-        def _on_post_llm_call(**kwargs):
+    if callable(register_hook):
+        def _persist_post_turn(**kwargs):
             history = kwargs.get("conversation_history")
             if not history:
                 return
             active_engine = kwargs.get("context_compressor")
-            if not (
+            # Explicit selection is authoritative, including a non-LCM engine.
+            # Never reinterpret that negative signal as permission to persist.
+            if "context_compressor" in kwargs and not (
                 active_engine is not None
                 and getattr(active_engine, "name", None) == "lcm"
-                and hasattr(active_engine, "ingest")
+                and callable(getattr(active_engine, "ingest", None))
             ):
-                active_engine = None
+                return
 
             session_id = str(kwargs.get("session_id") or "")
             conversation_id = str(
@@ -578,18 +562,19 @@ def register(ctx):
                 or ""
             )
             platform = str(kwargs.get("platform") or "")
-
             if active_engine is None:
+                # Older hosts omit the engine. Only a live, matching binding
+                # proves LCM owns this turn; an unbound prototype proves nothing.
                 active_engine = resolve_active_lcm_engine(
                     session_id=session_id,
                     conversation_id=conversation_id,
-                ) or engine
+                )
+            if active_engine is None:
+                return
 
             try:
                 # Session identity is authoritative for rebinding. Older hosts
-                # can deliver stale lane metadata alongside the correct active
-                # session id; rebinding a clone on conversation_id mismatch
-                # alone would move it away from the runtime it is serving.
+                # can deliver stale lane metadata alongside the correct session.
                 _ensure_engine_bound_to_session(
                     active_engine,
                     session_id,
@@ -600,9 +585,17 @@ def register(ctx):
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
-        logger.debug("LCM registered post_llm_call hook for per-turn ingest")
-    except Exception as exc:
-        logger.debug("LCM could not register post_llm_call hook: %s", exc)
+        def _on_post_llm_call(**kwargs):
+            with persistence_lock:
+                if registration_active:
+                    _persist_post_turn(**kwargs)
+
+        try:
+            register_hook("post_llm_call", _on_post_llm_call)
+            logger.debug("LCM registered owned post_llm_call hook for per-turn ingest")
+        except Exception as exc:
+            logger.debug("LCM could not register post_llm_call hook: %s", exc)
+    else:
+        logger.info("LCM per-turn hook unavailable: host has no owned hook registration API")
 
     logger.info("LCM plugin loaded — lossless context management active")
