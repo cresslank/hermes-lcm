@@ -5,8 +5,9 @@ row IDs; it cannot search, follow refs, consult assertions, or broaden scope.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import json
 import sqlite3
@@ -18,6 +19,13 @@ from .literal_record import validate_row
 
 _active: ContextVar = ContextVar("lcm_literal_source_invocation", default=None)
 VERSION = "supervision.literal-sources.v1"
+
+
+@dataclass
+class _Binding:
+    generation: object = field(default_factory=object)
+    transitions: int = 0
+    ready: bool = True
 
 
 @dataclass
@@ -37,10 +45,14 @@ def install_literal_source_owner(engine, facade):
         from agent.supervision_literal_sources import LiteralSourceProviderV1, LiteralSourceRecordV1
     except ImportError:
         return None
+    if not hasattr(LiteralSourceProviderV1, "literal_source_binding_fence"):
+        # Older v1 hosts cannot fence lifecycle generations; keep ordinary tools.
+        return None
 
     class Provider(LiteralSourceProviderV1):
         def __init__(self):
             self.engines = weakref.WeakKeyDictionary({engine: (engine._store, engine._hermes_home, engine._config.database_path)})
+            self.bindings = weakref.WeakKeyDictionary({engine: _Binding()})
             self.records = {}
             self.invocations = set()
             self.lock = threading.RLock()
@@ -51,11 +63,44 @@ def install_literal_source_owner(engine, facade):
             except (AttributeError, TypeError):
                 return False
 
+        def literal_source_binding(self, candidate):
+            with self.lock:
+                state = self.bindings.get(candidate)
+                if (state is None or not state.ready or state.transitions
+                        or not self.owns_engine(candidate)):
+                    return None
+                return (state.generation, candidate.current_session_id, candidate.current_conversation_id)
+
+        @contextmanager
+        def literal_source_binding_fence(self, candidate, binding):
+            # Final acceptance and lifecycle invalidation share this short lock.
+            # No row reads, host callbacks, or host graph locks beneath it.
+            with self.lock:
+                yield binding is not None and self.literal_source_binding(candidate) == binding
+
+        @contextmanager
+        def lifecycle(self, candidate, *, resume):
+            with self.lock:
+                state = self.bindings[candidate]
+                state.generation = object()  # irreversible even for A -> B -> A
+                state.transitions += 1
+                state.ready = False
+            succeeded = False
+            try:
+                yield
+                succeeded = True
+            finally:
+                with self.lock:
+                    state.transitions -= 1
+                    if not state.transitions:
+                        state.ready = succeeded and resume
+
         def bind_clone(self, parent, clone):
             if (parent in self.engines and type(clone) is type(engine)
                     and clone._hermes_home == engine._hermes_home
                     and clone._config.database_path == engine._config.database_path):
                 self.engines[clone] = (clone._store, clone._hermes_home, clone._config.database_path)
+                self.bindings[clone] = _Binding()
                 clone._literal_source_provider = self
 
         def capture(self, capture, row, start, end):
@@ -66,7 +111,8 @@ def install_literal_source_owner(engine, facade):
             if key in capture.refs:
                 return
             with self.lock:
-                if capture.invocation.id not in self.invocations:
+                if (capture.invocation.id not in self.invocations
+                        or self.literal_source_binding(capture.engine) != capture.invocation.binding):
                     capture.overflow = True
                     return
                 if len(capture.refs) >= 8 or len(self.records) >= 64:
@@ -75,25 +121,28 @@ def install_literal_source_owner(engine, facade):
                 ref = uuid.uuid4().hex
                 self.records[(capture.invocation.id, ref)] = (
                     capture.engine, record,
-                    (capture.engine.current_session_id, capture.engine.current_conversation_id))
+                    capture.invocation.binding)
                 capture.refs[key] = ref
 
         def resolve_literal_source(self, candidate, invocation_id, source_ref):
             with self.lock:
                 stored = self.records.get((invocation_id, source_ref))
                 if (stored is None or stored[0] is not candidate or not self.owns_engine(candidate)
-                        or stored[2] != (candidate.current_session_id, candidate.current_conversation_id)):
+                        or stored[2] != self.literal_source_binding(candidate)):
                     return None
                 original = stored[1]
                 store_id = int(original.exact_ref.split(":")[1])
-                # Point read of the original hydrated row, not evidence retrieval.
-                try:
-                    row = candidate._store.get(store_id)
-                except (sqlite3.Error, OSError):
-                    return None
-                current = validate_row(row, *original.record_span) if row is not None else None
-                if (current != original or not self.owns_engine(candidate)
-                        or stored[2] != (candidate.current_session_id, candidate.current_conversation_id)):
+            # Source I/O must not hold the lifecycle fence: the host takes that
+            # fence under its graph locks only after this resolver returns.
+            try:
+                row = candidate._store.get(store_id)
+            except (sqlite3.Error, OSError):
+                return None
+            current = validate_row(row, *original.record_span) if row is not None else None
+            with self.lock:
+                if (self.records.get((invocation_id, source_ref)) is not stored
+                        or current != original or not self.owns_engine(candidate)
+                        or stored[2] != self.literal_source_binding(candidate)):
                     self.records.pop((invocation_id, source_ref), None)
                     return None
                 return LiteralSourceRecordV1(**vars(original))
@@ -113,6 +162,22 @@ def install_literal_source_owner(engine, facade):
     if registration is not None:
         engine._literal_source_provider = provider
     return registration
+
+
+def literal_source_lifecycle(function):
+    """Invalidate before mutation; keep publication unavailable during rebinding.
+
+    Only a successful session start reopens capture. The native invocation's
+    generation never survives a lifecycle boundary, even if IDs return to A.
+    """
+    @wraps(function)
+    def wrapped(engine, *args, **kwargs):
+        provider = getattr(engine, "_literal_source_provider", None)
+        if provider is None:
+            return function(engine, *args, **kwargs)
+        with provider.lifecycle(engine, resume=function.__name__ == "on_session_start"):
+            return function(engine, *args, **kwargs)
+    return wrapped
 
 
 def observe_hydrated(engine, row, start, end):

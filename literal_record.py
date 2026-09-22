@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -25,6 +26,26 @@ ROW_FIELDS = ("store_id", "session_id", "source", "role", "content", "tool_call_
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _number(token):
+    """Only admit tokens faithfully expressible by the existing JSON encoder.
+
+    Decimal is an input oracle, not a new coordinate type. Check the original
+    bound before conversion, then compare numerical meaning after canonical
+    encoding. This preserves ordinary 0.1 while rejecting underflow/rounding.
+    copy_abs avoids Decimal's ambient arithmetic precision rounding the bound.
+    """
+    try:
+        original = Decimal(token)
+        if not original.is_finite() or original.copy_abs() > 2**53 - 1:
+            raise ValueError("literal_value_unknown")
+        value = float(token)
+        if not math.isfinite(value) or Decimal(canonical(value)) != original:
+            raise ValueError("literal_value_unrepresentable")
+        return value
+    except InvalidOperation as exc:
+        raise ValueError("literal_value_unrepresentable") from exc
 
 
 def _object(pairs):
@@ -82,7 +103,7 @@ def validate_row(row, start, end):
         source_bytes = content.encode("utf-8", errors="strict")
         if not 0 < len(source_bytes) <= MAX_BYTES:
             return None
-        record = json.loads(content, object_pairs_hook=_object,
+        record = json.loads(content, object_pairs_hook=_object, parse_float=_number,
                             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
         _keys(record, "schema entity predicate time scope quantity value polarity modality")
         if record["schema"] != SCHEMA:

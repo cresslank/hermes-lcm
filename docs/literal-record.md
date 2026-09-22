@@ -52,7 +52,14 @@ bytes, with exactly these fields:
   reject. No conversions or equivalent-spelling guesses occur.
 - Values/condition values support booleans, nonempty strings of at most 256
   characters without control characters, or finite numbers of absolute value
-  at most `2**53 - 1`. Null/list/map values are unknown/unsupported and abstain.
+  at most `2**53 - 1`. The original numeric token must round-trip without
+  changing its numerical meaning through the existing canonical JSON encoder.
+  Bounds are checked before conversion; underflow and lossy decimal tokens
+  abstain (for example `1e-400`, `0.100000000000000000001`, and
+  `9007199254740991.1`). Ordinary `0.1`, `1.25`, and in-bound integers remain
+  supported. This applies equally to record values and scope conditions; it
+  introduces no arbitrary-precision coordinate type. Null/list/map values are
+  unknown/unsupported and abstain.
 - Polarity is `positive|negative`; modality is `asserted|possible|necessary`.
   Their presence describes the original assertion, not model confidence.
 
@@ -91,6 +98,14 @@ public tool argument schema. A copied ref/payload is not owner authority.
 The provider pins active engine/store/home/database and session binding. Store
 rebinding, changed rows, revoked registration/grants and expired/stale invocations
 fail closed. Lookup is recipient-specific; another plugin cannot borrow a grant.
+The native invocation also pins a per-engine lifecycle generation. Session
+start/end/reset/shutdown invalidate it before mutation; only a successful start
+reopens capture. A→B→A cannot revive an old invocation. Publication and lookup
+accept under the same short provider fence used by lifecycle invalidation, after
+row reads finish outside host and provider locks. A fresh legitimate invocation
+can publish after rebinding, but cannot renew the original shared deadline.
+Older host adapters without the coordinated fence retain ordinary tool output
+without native source publication.
 
 The native host's `SourcePropositionV1` contains `LiteralSourceRecordV1` with
 `schema_id,exact_ref,row_hash,record_span,source_bytes,coordinate_pins,source_attribution`.
