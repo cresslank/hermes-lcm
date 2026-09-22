@@ -630,6 +630,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             hermes_home=self._hermes_home,
         )
         clone.supervision = getattr(self, "supervision", None)
+        literal_provider = getattr(self, "_literal_source_provider", None)
+        if literal_provider is not None:
+            literal_provider.bind_clone(self, clone)
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key

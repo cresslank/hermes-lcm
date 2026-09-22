@@ -861,6 +861,10 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
     return encoded
 
 
+from .literal_source import literal_source_tool
+
+
+@literal_source_tool
 def lcm_evidence_pack(args: Dict[str, Any], **kwargs) -> str:
     """Build a bounded exact-evidence packet and optional canonical trace."""
     engine = _require_engine(kwargs)
@@ -875,6 +879,7 @@ def lcm_evidence_pack(args: Dict[str, Any], **kwargs) -> str:
     )
 
 
+@literal_source_tool
 def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
     """Compile evidence through legacy proposal or deterministic auto mode."""
     engine = _require_engine(kwargs)

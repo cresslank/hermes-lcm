@@ -454,6 +454,8 @@ def _resolve_candidate(
             if key_name in operand and operand[key_name] is not None
         },
     }
+    from .literal_record import observe_hydrated
+    observe_hydrated(engine, row, span_start, span_end)
     return ResolvedCandidate(operand=operand, public=public), None
 
 

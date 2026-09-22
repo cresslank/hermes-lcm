@@ -1,5 +1,10 @@
 # Optional supervision owner contract
 
+The separate, default-off [literal-record source contract](literal-record.md)
+qualifies original structured assertions at ordinary pack/compile hydration.
+It does not reinterpret the ranking/recovery facts below as truth or coordinate
+authority, and makes no inference calls.
+
 No provider is imported or discovered. Registration captures the public runtime
 `PluginContext.supervision` facade. Disabled, unavailable, unnegotiated, invalid,
 expired or stale decisions preserve the existing output; no late hints are saved.

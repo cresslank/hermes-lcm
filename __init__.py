@@ -425,6 +425,8 @@ def register(ctx):
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
+    from .literal_source import install_literal_source_owner
+    install_literal_source_owner(engine, engine.supervision)
 
     # Ship the same recall contract through both Hermes plugin skill
     # registration (explicit qualified loads) and the installer's ordinary
