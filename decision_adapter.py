@@ -8,7 +8,8 @@ network consent. This module does not import or discover any judgment provider.
 
 Requests use supervision.v1, an invocation-local request_id, absolute monotonic
 deadline, owner/event, facts and completeness. Responses echo request_id and
-contain only candidate_ids (rank) or candidate_id + relation (history). The
+contain candidate_ids (rank) or candidate_id + relation (history). Negotiated
+rank output may also carry bounded conflict/isolation IDs for the final renderer. The
 facade must reject stale revisions. Detached projections cannot mutate evidence.
 LCM revalidates IDs and exact bytes; no decision changes coverage or computation.
 """
@@ -63,6 +64,13 @@ def _request(facade, method: str, *, event: str, facts: dict,
     request = {"protocol": "supervision.v1", "owner": "lcm", "event": event,
                "request_id": request_id, "deadline": deadline,
                "facts": copy.deepcopy(facts), "completeness": copy.deepcopy(completeness)}
+    # Optional native output contract; old hosts remain order-only.
+    try:
+        from agent.supervision_retrieval_presentation import VERSION, negotiated
+        if method == "rank_candidates" and negotiated(facade):
+            request["output_contract"] = VERSION
+    except ImportError:
+        pass
     context = contextvars.copy_context()
     try:
         if facade.negotiate("supervision.v1").get("owner_deadline") is True:
@@ -78,6 +86,9 @@ def _request(facade, method: str, *, event: str, facts: dict,
                 or response.get("request_id") != request_id):
             if isinstance(response, Mapping):
                 acknowledge(facade, response)
+            return None
+        if response.get("output_contract") != request.get("output_contract"):
+            acknowledge(facade, response)
             return None
         return response
     except Exception:
@@ -159,32 +170,38 @@ def rank_candidates(facade, query: str, ordered: list[dict], *, window: int,
     if response is None:
         return ordered
     ids = response.get("candidate_ids")
-    conflicts = response.get("conflict_ids", [])
+    blocks = [response.get(k, []) for k in ("conflict_ids", "isolated_ids")]
     if (not isinstance(ids, (list, tuple)) or not all(isinstance(x, str) for x in ids)
             or len(ids) != len(by_id) or set(ids) != set(by_id)
-            or not isinstance(conflicts, (list, tuple))
-            or not all(isinstance(x, str) and x in by_id for x in conflicts)):
+            or any(not isinstance(values, (list, tuple))
+                   or any(type(x) is not str or x not in by_id for x in values)
+                   or len(set(values)) != len(values) for values in blocks)):
         acknowledge(facade, response)
         return ordered
     if engine is not None and source_rows and (time.monotonic() >= deadline or any(
             engine._store.get(sid) != row for sid, row in source_rows.items())):
         acknowledge(facade, response)
         return ordered
+    if (list(ids) == list(by_id) and not (
+            response.get("output_contract") == "supervision.retrieval-presentation.v1" and any(blocks))):
+        acknowledge(facade, response)
+        return ordered
     # Conflicts remain source evidence, never synthesized text or deleted refs.
     result = [by_id[x] for x in ids] + ordered[len(head):]
     if response.get("consumption") == "supervision.owner-consumption.v1":
         return SelectedRank(result, baseline=ordered, facade=facade, response=response,
-                            deadline=deadline, source_rows=source_rows)
+                            deadline=deadline, source_rows=source_rows, candidates=candidates, by_id=by_id)
     return result if acknowledge(facade, response, result) else ordered
 
 
 class SelectedRank(list):
     """Invocation-local pending selection, never an applied internal permutation."""
-    def __init__(self, entries, *, baseline, facade, response, deadline, source_rows):
+    def __init__(self, entries, *, baseline, facade, response, deadline, source_rows, candidates=(), by_id=None):
         super().__init__(entries)
         self.baseline = baseline
         self.facade, self.response = facade, response
         self.deadline, self.source_rows = deadline, source_rows
+        self.candidates, self.by_id = candidates, by_id or {}
 
 
 def finish_rank(selection, shape, args):
@@ -205,6 +222,28 @@ def finish_rank(selection, shape, args):
         winner = _hit_identity(selection[0]["hit"])
         effective = (hits and winner == _hit_identity(hits[0]) and
                      [_hit_identity(h) for h in hits] != [_hit_identity(h) for h in original_hits])
+        if selection.response.get("output_contract") == "supervision.retrieval-presentation.v1":
+            from agent.supervision_retrieval_presentation import annotate, negotiated, validate
+            if not negotiated(selection.facade):
+                raise ValueError("presentation_downgrade")
+            conflicts, isolated = validate(selection.response, selection.by_id)
+            if conflicts or isolated:
+                # Annotation cannot make a source lost by diversity/hydration
+                # appear preserved. Keep every baseline row and flagged qualifier.
+                final_by_key = {_hit_identity(h): (i, h) for i, h in enumerate(hits)}
+                if any(final_by_key.get(_hit_identity(h), (None, None))[1] != h for h in original_hits):
+                    raise ValueError("presentation_source_loss")
+                locations = {}
+                for candidate in selection.candidates:
+                    key = _hit_identity(selection.by_id[candidate["id"]]["hit"])
+                    index, hit = final_by_key.get(key, (None, None))
+                    locations[candidate["id"]] = (f"#/hits/{index}", candidate["ref"])
+                    if candidate["id"] in (*conflicts, *isolated) and (
+                            hit is None or hit.get("content", hit.get("snippet")) != candidate["excerpt"]):
+                        raise ValueError("presentation_qualifier_loss")
+                document = annotate(json.loads(encoded), selection.response, locations)
+                encoded = json.dumps(document, ensure_ascii=False, allow_nan=False)
+                effective = True
         current = (time.monotonic() < selection.deadline and all(
             args["engine"]._store.get(sid) == row for sid, row in selection.source_rows.items()))
         within_cap = len(encoded) <= _LCM_RECALL_RESPONSE_CHAR_CAP
