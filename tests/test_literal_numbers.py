@@ -5,7 +5,7 @@ import json
 import pytest
 
 from hermes_lcm.literal_record import validate_row
-from .test_literal_record import engine, literal, row
+from .test_literal_record import engine as engine, literal, row
 
 
 @pytest.mark.parametrize("field", ["value", "condition"])
