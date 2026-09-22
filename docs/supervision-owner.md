@@ -108,3 +108,23 @@ Changed rows, oversized views or failed exact reads send an explicit rejection;
 an applied receipt must never precede that veto. Receipt storage belongs to the
 host's shared settlement seam, not LCM. No acknowledgment claims latest-state
 truth, completeness, or successful external inference.
+
+For rank selections, `decision_adapter.SelectedRank` is invocation-local pending
+state, not an applied permutation. `recall_response.shape_recall_response` runs
+the unchanged diversity, hydration, exact-ref/delta and serialization validators
+for both baseline and candidate views. Only a surviving selected winner and a
+changed delivered identity order/subset can consume the preference. All-seen,
+empty, dropped-winner, cap/serialization failures and final authority vetoes
+return the ordinarily shaped baseline. The rank digest is SHA-256 of the exact
+UTF-8 serialized recall response bytes; nothing is reshaped after that ack.
+The baseline comparison adds bounded local shaping work, never another search,
+judgment or deadline. Disabled/non-native output shaping remains unchanged.
+
+Native history recovery requires `begin_history_expansion(selection)` from the
+host (`history_read_fence=supervision.history-read.v1`). This one-use owner-only
+lease spans only the existing bounded local reader, serializing grant revocation
+and instruction revisions at the read boundary, not merely at post-read ack.
+Missing native support rejects the recovery rather than performing an unfenced
+read. The original post-read validators and deadline still apply. Structured
+model-visible tool arguments count toward exact-ref availability; hidden reasoning
+does not. Known exact refs remain on direct `lcm_expand` without judgment.

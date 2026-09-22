@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Mapping
 from .decision_adapter import supports, recover_missing_history
 
 
@@ -22,7 +23,8 @@ def recover_from_grep(engine, args, response, *, deadline):
     absent = getattr(facade, "history_source_absent", None)
     if not callable(absent):
         return None
-    hits = []
+    hits, visible_refs = [], []
+    visibility = getattr(facade, "history_source_visibility", None)
     for hit in response.get("results", ())[:8]:
         sid = hit.get("store_id")
         if type(sid) is not int:
@@ -34,13 +36,25 @@ def recover_from_grep(engine, args, response, *, deadline):
         if not isinstance(text, str) or not 0 < len(text) <= 1200:
             continue
         ref = f"lcm:{sid}:0-{len(text)}"
-        if absent(ref, text) is not True:
+        if callable(visibility):
+            state = visibility(ref, text)
+            if (not isinstance(state, Mapping) or
+                    type(state.get("explicit_ref_available")) is not bool or
+                    type(state.get("source_text_visible")) is not bool):
+                return None
+            if state.get("explicit_ref_available") is True:
+                visible_refs.append(ref)
+            if state.get("source_text_visible") is True or state.get("explicit_ref_available") is True:
+                continue
+        elif absent(ref, text) is not True:
             continue
         hits.append({"exact_ref": ref, "excerpt": text, "temporal_status": "unknown",
                      "source_version": hashlib.sha256(json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()})
-    if not hits or time.monotonic() >= deadline:
+    # An available exact handle belongs on the existing direct lcm_expand
+    # route, not a second semantic discovery/expansion opportunity.
+    if visible_refs or not hits or time.monotonic() >= deadline:
         return None
     slot_id = hashlib.sha256((engine.current_session_id + "\0" + question).encode()).hexdigest()
     return recover_missing_history(engine, {"slot_id": slot_id, "question": question,
-        "expansion_budget": 1, "explicit_ref_available": False, "visible_refs": [],
+        "expansion_budget": 1, "explicit_ref_available": bool(visible_refs), "visible_refs": visible_refs,
         "temporal_contract": "historical_source_v1", "hits": hits}, deadline=deadline)

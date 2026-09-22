@@ -86,15 +86,15 @@ def _request(facade, method: str, *, event: str, facts: dict,
         return None
 
 
-def acknowledge(facade, response, result=None):
+def acknowledge(facade, response, result=None, *, serialized=False):
     """A selected ID is not a consumed view; postvalidation may still veto it."""
     try:
         if response.get("consumption") != "supervision.owner-consumption.v1":
             capability = facade.negotiate("supervision.v1")
             return isinstance(capability, Mapping) and capability.get("owner_consumption") is None
-        digest = None if result is None else hashlib.sha256(json.dumps(
-            result, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
-            allow_nan=False).encode()).hexdigest()
+        encoded = result if serialized else json.dumps(
+            result, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        digest = None if result is None else hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         receipt = facade.acknowledge_owner({"request_id": response["request_id"],
             "receipt_id": response["receipt_id"], "candidate_ids": response["candidate_ids"],
             "effect_digest": digest})
@@ -172,7 +172,52 @@ def rank_candidates(facade, query: str, ordered: list[dict], *, window: int,
         return ordered
     # Conflicts remain source evidence, never synthesized text or deleted refs.
     result = [by_id[x] for x in ids] + ordered[len(head):]
+    if response.get("consumption") == "supervision.owner-consumption.v1":
+        return SelectedRank(result, baseline=ordered, facade=facade, response=response,
+                            deadline=deadline, source_rows=source_rows)
     return result if acknowledge(facade, response, result) else ordered
+
+
+class SelectedRank(list):
+    """Invocation-local pending selection, never an applied internal permutation."""
+    def __init__(self, entries, *, baseline, facade, response, deadline, source_rows):
+        super().__init__(entries)
+        self.baseline = baseline
+        self.facade, self.response = facade, response
+        self.deadline, self.source_rows = deadline, source_rows
+
+
+def finish_rank(selection, shape, args):
+    """Settle only the exact UTF-8 tool response after all ordinary shaping.
+
+    Both views use the same validators. A dropped winner, unchanged delivery,
+    serialization failure or revoked/expired grant returns the shaped baseline.
+    No retrieval, new decision, or renewed deadline is introduced here.
+    """
+    from .tools import _hit_identity, _LCM_RECALL_RESPONSE_CHAR_CAP
+    try:
+        baseline = shape(ordered=copy.deepcopy(selection.baseline), rerank_status="disabled",
+                         **{**args, "summary_leads": copy.deepcopy(args["summary_leads"])})
+        encoded = shape(ordered=copy.deepcopy(list(selection)), rerank_status="applied",
+                        **{**args, "summary_leads": copy.deepcopy(args["summary_leads"])})
+        hits = json.loads(encoded)["hits"]
+        original_hits = json.loads(baseline)["hits"]
+        winner = _hit_identity(selection[0]["hit"])
+        effective = (hits and winner == _hit_identity(hits[0]) and
+                     [_hit_identity(h) for h in hits] != [_hit_identity(h) for h in original_hits])
+        current = (time.monotonic() < selection.deadline and all(
+            args["engine"]._store.get(sid) == row for sid, row in selection.source_rows.items()))
+        within_cap = len(encoded) <= _LCM_RECALL_RESPONSE_CHAR_CAP
+        if effective and current and within_cap:
+            if acknowledge(selection.facade, selection.response, encoded, serialized=True):
+                return encoded
+        else:
+            acknowledge(selection.facade, selection.response)
+        return baseline
+    except Exception:
+        acknowledge(selection.facade, selection.response)
+        # Preserve ordinary baseline errors rather than manufacture an empty success.
+        return shape(ordered=copy.deepcopy(selection.baseline), rerank_status="disabled", **args)
 
 
 def recover_missing_history(engine, slot: Mapping, *, deadline: float) -> dict | None:
@@ -275,8 +320,22 @@ def recover_missing_history(engine, slot: Mapping, *, deadline: float) -> dict |
             return None
         engine._supervision_recovered_slots = recovered | {key}
     try:
-        result = json.loads(lcm_expand({"store_id": store_id, "content_offset": start,
-                                       "max_tokens": 600, "include_exact_ref": True}, engine=engine))
+        from contextlib import nullcontext
+        # Legacy non-native adapters have no host selection capability. Native
+        # selections MUST acquire the host's revision/registration read fence.
+        native = response.get("consumption") == "supervision.owner-consumption.v1"
+        fence = facade.begin_history_expansion(response) if native else nullcontext(True)
+        with fence as admitted:
+            if not admitted:
+                acknowledge(facade, response)
+                return None
+            if (time.monotonic() >= deadline or
+                    (slot.get("temporal_contract") == "historical_source_v1" and
+                     facade.history_source_absent(selected, before["content"]) is not True)):
+                acknowledge(facade, response)
+                return None
+            result = json.loads(lcm_expand({"store_id": store_id, "content_offset": start,
+                                           "max_tokens": 600, "include_exact_ref": True}, engine=engine))
     except Exception:
         acknowledge(facade, response)
         return None

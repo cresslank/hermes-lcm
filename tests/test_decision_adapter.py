@@ -271,3 +271,40 @@ def test_source_projection_hydrates_whole_native_row_not_fts_markup(engine):
     assert all(c["qualifiers_complete"] is True and c["constraints_match"] is True for c in facts["candidates"])
     assert all("qualifying limitation" in c["excerpt"] for c in facts["candidates"])
     assert incoming[0]["hit"]["snippet"] == "[Claim] 0"
+
+
+@pytest.mark.parametrize("all_seen", [False, True])
+def test_native_rank_acknowledges_only_serialized_recall(engine, all_seen):
+    import hashlib
+
+    class ConsumptionFacade(DelayedFacade):
+        def __init__(self):
+            super().__init__(delay=0)
+            self.acks = []
+
+        def negotiate(self, version):
+            return {**super().negotiate(version), "owner_deadline": True,
+                    "owner_consumption": "supervision.owner-consumption.v1"}
+
+        def rank_candidates(self, request):
+            return {**super().rank_candidates(request), "receipt_id": "pending-rank",
+                    "consumption": "supervision.owner-consumption.v1"}
+
+        def acknowledge_owner(self, ack):
+            self.acks.append(ack)
+            return {"status": "applied" if ack["effect_digest"] else "rejected"}
+
+    facade = engine.supervision = ConsumptionFacade()
+    refs = []
+    for i in range(10):
+        text = f"Claim {i}; qualifier retained."
+        sid = engine._store.append("current", {"role": "user", "content": text})
+        refs.append(f"lcm:{sid}:0-{len(text)}")
+    encoded = tools.lcm_recall({"query": "Claim", "detail": "answer_ready", "limit": 10,
+                                "seen_refs": refs if all_seen else []}, engine=engine)
+    result = json.loads(encoded)
+    assert len(facade.requests) == len(facade.acks) == 1
+    expected = None if all_seen else hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    assert facade.acks[0]["effect_digest"] == expected
+    assert bool(result["hits"]) is not all_seen
+    assert result["provenance"]["rerank"] == ("disabled" if all_seen else "applied")
