@@ -2804,6 +2804,7 @@ def _run_within_deadline(
     remaining_s = float(remaining_s)
     if remaining_s <= 0:
         raise TimeoutError("semantic latency budget exhausted")
+    worker_deadline = time.monotonic() + remaining_s
     slots = _lcm_semantic_worker_slots if worker_slots is None else worker_slots
     if not slots.acquire(blocking=False):
         raise _WorkerCapacityError(f"{name} worker capacity is exhausted")
@@ -2823,7 +2824,8 @@ def _run_within_deadline(
     except BaseException:
         slots.release()
         raise
-    worker.join(remaining_s)
+    # Thread startup/queueing consumes the same budget, not a fresh join window.
+    worker.join(max(0.0, worker_deadline - time.monotonic()))
     if worker.is_alive():
         raise TimeoutError(f"{name} exceeded the semantic latency budget")
     succeeded, value = outcome[0]
@@ -4523,6 +4525,9 @@ def _lcm_recall_rerank(
     window: int,
     deadline: float,
     config: Any,
+    supervision: Any = None,
+    scope: dict | None = None,
+    completeness: dict | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Optionally REORDER the top ``window`` fused candidates in ONE API call.
 
@@ -4537,6 +4542,16 @@ def _lcm_recall_rerank(
     provider, non-voyage, network, deadline) skips silently back to the incoming
     order with a ``skipped: <reason>`` status.
     """
+    from .decision_adapter import admission_deadline, rank_candidates, supports
+
+    if supports(supervision, "rank_candidates"):
+        ranked = rank_candidates(
+            supervision, query, ordered, window=window,
+            deadline=admission_deadline(deadline), scope=scope or {},
+            completeness=completeness or {},
+        )
+        # One rank owner: never chain Voyage after a semantic abstention/timeout.
+        return ranked, ("applied" if ranked is not ordered else "disabled")
     if not bool(getattr(config, "rerank_enabled", False)):
         return ordered, "disabled"
     if (
@@ -4915,7 +4930,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # -- Optional rerank stage (default OFF): a pure rank-REORDER within the top
     #    window of the post-prior order (no score splicing onto the RRF scale). --
     ordered, rerank_status = _lcm_recall_rerank(
-        provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
+        provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config,
+        supervision=getattr(engine, "supervision", None),
+        scope={"session_scope": "all", "current_session_id": engine.current_session_id},
+        completeness={"retrieval_coverage": coverage, "archive_complete": False},
     )
 
     # -- Response shaping (char-capped). The default snippets path retains the

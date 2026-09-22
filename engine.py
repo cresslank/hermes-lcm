@@ -629,6 +629,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
         )
+        clone.supervision = getattr(self, "supervision", None)
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key

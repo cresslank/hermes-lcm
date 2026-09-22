@@ -48,6 +48,23 @@ _DENIED_SQLITE_ROOTS = tuple(
 _SQLITE_OPEN_AUDIT: set[str] = set()
 _SQLITE_DENIAL_AUDIT: list[str] = []
 _ORIGINAL_SQLITE_CONNECT = sqlite3.connect
+_PYTEST_SANDBOX: Path | None = None
+
+
+def pytest_sessionstart(session):
+    """Allow only pytest's freshly owned sandbox, including profile scratch.
+
+    Operators may require TMPDIR beneath ~/.hermes/cache/scratch. The live-root
+    guard still denies every other path; resolving both roots prevents symlink
+    escapes from the test sandbox from gaining this exemption.
+    """
+    global _PYTEST_SANDBOX
+    sandbox = session.config._tmp_path_factory.getbasetemp().resolve()
+    scratch_roots = tuple((root / "cache" / "scratch").resolve() for root in _DENIED_SQLITE_ROOTS)
+    # Only a sanctioned scratch subtree needs an exception to the live-root
+    # denial; never exempt an arbitrary --basetemp elsewhere in Hermes home.
+    if any(sandbox.is_relative_to(scratch) and sandbox != scratch for scratch in scratch_roots):
+        _PYTEST_SANDBOX = sandbox
 
 
 def _sqlite_target_path(database) -> Path | None:
@@ -87,6 +104,8 @@ def _assert_safe_sqlite_target(database) -> None:
         return
     rendered = str(target)
     _SQLITE_OPEN_AUDIT.add(rendered)
+    if _PYTEST_SANDBOX is not None and target.is_relative_to(_PYTEST_SANDBOX):
+        return
     if any(target == root or target.is_relative_to(root) for root in _DENIED_SQLITE_ROOTS):
         _SQLITE_DENIAL_AUDIT.append(rendered)
         raise UnsafeSQLitePathError(
@@ -120,6 +139,8 @@ def _isolated_hermes_environment(tmp_path_factory, monkeypatch):
     hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TMPDIR", str(environment_root))
+    monkeypatch.setattr(tempfile, "tempdir", str(environment_root))
 
 
 def pytest_terminal_summary(terminalreporter):
