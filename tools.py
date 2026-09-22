@@ -3458,6 +3458,25 @@ def _lcm_grep_hybrid(
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
+    """Ordinary grep plus one explicitly requested, owner-scoped history recovery."""
+    from .decision_adapter import admission_deadline
+    deadline = admission_deadline(time.monotonic() + 0.150)
+    baseline = _lcm_grep_baseline(args, **kwargs)
+    if "missing_decision" not in args:
+        return baseline
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return baseline
+    from .history_recovery import recover_from_grep
+    response = json.loads(baseline)
+    recovered = recover_from_grep(engine, args, response, deadline=deadline)
+    if recovered is None:
+        return baseline
+    return json.dumps({**response, "recovered_history": recovered,
+        "recovery_scope": "one supplied historical source; present truth and supersession unknown"}, ensure_ascii=False)
+
+
+def _lcm_grep_baseline(args: Dict[str, Any], **kwargs) -> str:
     """Search LCM history using full-text, semantic, or RRF hybrid retrieval."""
     request_started = time.monotonic()
     mode = str(args.get("mode") or "full_text").strip().lower()

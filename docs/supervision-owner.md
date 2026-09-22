@@ -14,7 +14,8 @@ The synchronous methods are:
 
 - `rank_candidates(request: Mapping) -> Mapping | None`
 - `select_windows(request: Mapping) -> Mapping | None`
-- `evaluate_relation(request: Mapping) -> Mapping | None`
+- `expand_one_owned_ref(request: Mapping) -> Mapping | None`
+- `acknowledge_owner(acknowledgment: Mapping) -> Mapping | None`
 
 Requests contain `protocol`, `owner`, `event`, invocation-local `request_id`,
 absolute monotonic `deadline`, `facts`, and `completeness`. The host resolves the
@@ -46,10 +47,16 @@ the original source objects, fusion/final scores, exact refs, roles, lineage and
 the entire tail. Existing diversity, reference-strict, finite-coverage and
 computation validators still run downstream.
 
-The pre-LLM owner consumes only explicit `missing_history_slot` and
-`supervision_deadline` hook state. The slot has `slot_id`, `question`, up to eight
-`hits=[{exact_ref, excerpt}]`, `visible_refs`, and `expansion_budget=1`. It is not a
-new model tool argument. The owner validates exact bytes against its own store
+The ordinary producer is the existing `lcm_grep` tool's optional
+`missing_decision` argument: an explicit caller request, never a source/prose
+heuristic. It runs the original search once, in its unchanged current/history
+scope, then offers at most eight of that result's existing message IDs. Native
+request assembly supplies exact visibility; missing visibility, already visible
+source text/refs and foreign sessions abstain. There is no extra generated query,
+search or broad-scope fallback. The pre-LLM compatibility owner can also consume
+explicit `missing_history_slot` and `supervision_deadline` hook state. The slot has `slot_id`, `question`, up to eight
+`hits=[{exact_ref, excerpt}]`, `visible_refs`, and `expansion_budget=1`. It is an internal record, not a
+caller-supplied source/grant map. The owner validates exact bytes against its own store
 and existing current-conversation lineage. Cross-conversation candidates,
 fabricated excerpts and already visible refs abstain. One selected ref goes
 through existing `lcm_expand` (600-token bound), with live row/scope checks before
@@ -84,11 +91,20 @@ it never certifies semantic entity/date agreement. Other snippets remain unknown
 The owner does not have an already-certified complete answer at this retrieval
 stage; downstream exact/finite-coverage/computation validators remain unchanged.
 
-F15 now additionally requires **host-owned** slot `explicit_ref_available=False`
-and each hit's explicit `current=True`, `superseded=False`. These are not inferred
-from stored text, age, exact-ref validity or absence of truncation. Unknown facts
-abstain before judgment. Complete bounded native-row excerpts establish only
-excerpt integrity; the host still owns the currency/supersession assertion.
-The native engine must implement the `expand_one_owned_ref` -> `evaluate_relation`
-codec with the selected singleton ID and `states_missing_decision`; otherwise no
-expansion is claimed. No automatic producer of missing-slot currency is added.
+F15's ordinary producer uses `temporal_contract=historical_source_v1`: a hash of
+the current exact source row and `temporal_status=unknown`. That pin establishes
+source identity/currency, not that a historical decision remains current or was
+never superseded. Older host-owned slots may still carry independently supplied
+`current=True/superseded=False`; absence never manufactures those assertions.
+The selected hit must pass its own fit judgment. Expansion uses the dedicated
+literal `supervision.exact-expansion.v1` codec/action/grant, never a relation alias.
+Before and after the existing exact reader, LCM compares source bytes, session,
+role, lineage, source, offsets and exact ref under the original deadline. One
+slot is charged at most once even when postvalidation rejects the read.
+
+Selection remains `accepted/owner_selected` until the adapter validates and
+acknowledges its actual JSON result using `supervision.owner-consumption.v1`.
+Changed rows, oversized views or failed exact reads send an explicit rejection;
+an applied receipt must never precede that veto. Receipt storage belongs to the
+host's shared settlement seam, not LCM. No acknowledgment claims latest-state
+truth, completeness, or successful external inference.

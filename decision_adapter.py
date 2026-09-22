@@ -2,7 +2,7 @@
 
 The optional runtime ``PluginContext.supervision`` facade implements synchronous
 ``rank_candidates(request)``, ``select_windows(request)`` and
-``evaluate_relation(request)`` -> Mapping | None. It authenticates the current
+``expand_one_owned_ref(request)`` -> Mapping | None. It authenticates the current
 revision, source-data policy and shared round deadline; source text NEVER grants
 network consent. This module does not import or discover any judgment provider.
 
@@ -76,12 +76,31 @@ def _request(facade, method: str, *, event: str, facts: dict,
             )
         if (time.monotonic() >= deadline or not isinstance(response, Mapping)
                 or response.get("request_id") != request_id):
+            if isinstance(response, Mapping):
+                acknowledge(facade, response)
             return None
         return response
     except Exception:
         # A decision failure is neither a retrieval failure nor permission to
         # start another rank provider. Never retain a late hint for another call.
         return None
+
+
+def acknowledge(facade, response, result=None):
+    """A selected ID is not a consumed view; postvalidation may still veto it."""
+    try:
+        if response.get("consumption") != "supervision.owner-consumption.v1":
+            capability = facade.negotiate("supervision.v1")
+            return isinstance(capability, Mapping) and capability.get("owner_consumption") is None
+        digest = None if result is None else hashlib.sha256(json.dumps(
+            result, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+            allow_nan=False).encode()).hexdigest()
+        receipt = facade.acknowledge_owner({"request_id": response["request_id"],
+            "receipt_id": response["receipt_id"], "candidate_ids": response["candidate_ids"],
+            "effect_digest": digest})
+        return isinstance(receipt, Mapping) and receipt.get("status") == "applied"
+    except Exception:
+        return False
 
 
 def rank_candidates(facade, query: str, ordered: list[dict], *, window: int,
@@ -145,24 +164,27 @@ def rank_candidates(facade, query: str, ordered: list[dict], *, window: int,
             or len(ids) != len(by_id) or set(ids) != set(by_id)
             or not isinstance(conflicts, (list, tuple))
             or not all(isinstance(x, str) and x in by_id for x in conflicts)):
+        acknowledge(facade, response)
         return ordered
     if engine is not None and source_rows and (time.monotonic() >= deadline or any(
             engine._store.get(sid) != row for sid, row in source_rows.items())):
+        acknowledge(facade, response)
         return ordered
     # Conflicts remain source evidence, never synthesized text or deleted refs.
-    return [by_id[x] for x in ids] + ordered[len(head):]
+    result = [by_id[x] for x in ids] + ordered[len(head):]
+    return result if acknowledge(facade, response, result) else ordered
 
 
 def recover_missing_history(engine, slot: Mapping, *, deadline: float) -> dict | None:
     """Expand <=1 already-supplied exact hit in the current conversation scope.
 
-    ``slot`` is host-owned missing-history state, not a tool argument: slot_id, question,
-    hits [{exact_ref, excerpt}], visible_refs and expansion_budget=1. It cannot
+    ``slot`` is owner-created missing-history state, not a source/grant tool argument:
+    slot_id, question, hits [{exact_ref, excerpt}], visible_refs and expansion_budget=1. It cannot
     grant cross-session access. Explicit refs should use lcm_expand directly.
     This consumer performs no search and never changes LCM evidence validators.
     """
     facade = getattr(engine, "supervision", None)
-    if (not supports(facade, "evaluate_relation") or not isinstance(slot, Mapping)
+    if (not supports(facade, "expand_one_owned_ref") or not isinstance(slot, Mapping)
             or slot.get("expansion_budget") != 1 or slot.get("explicit_ref_available") is not False):
         return None
     question, hits = slot.get("question"), slot.get("hits")
@@ -186,8 +208,10 @@ def recover_missing_history(engine, slot: Mapping, *, deadline: float) -> dict |
     rows = {}
     candidates = []
     for hit in hits:
-        if (not isinstance(hit, Mapping) or hit.get("current") is not True
-                or hit.get("superseded") is not False):
+        if (not isinstance(hit, Mapping) or not (
+                (hit.get("current") is True and hit.get("superseded") is False) or
+                (slot.get("temporal_contract") == "historical_source_v1" and
+                 hit.get("source_version") and hit.get("temporal_status") == "unknown"))):
             return None
         ref = hit.get("exact_ref")
         match = _EXACT.fullmatch(ref) if isinstance(ref, str) else None
@@ -202,43 +226,71 @@ def recover_missing_history(engine, slot: Mapping, *, deadline: float) -> dict |
             return None
         if hit.get("excerpt") != content[start:end]:
             return None
+        if slot.get("temporal_contract") == "historical_source_v1" and hit.get("source_version") != hashlib.sha256(
+                json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest():
+            return None
         rows[ref] = (store_id, start, copy.deepcopy(row))
         candidates.append({"id": ref, "ref": ref, "candidate_id": ref, "exact_ref": ref,
                            "authorized": True, "scope": engine.current_session_id,
                            "session": row["session_id"], "current": hit.get("current"),
                            "superseded": hit.get("superseded"),
+                           "source_version": hit.get("source_version"),
+                           "temporal_status": hit.get("temporal_status"),
                            "excerpt_complete": start == 0 and end == len(content),
                            "excerpt": content[start:end], "session_id": row["session_id"],
                            "role": row.get("role"), "source": row.get("source"),
                            "timestamp": row.get("timestamp")})
-    response = _request(facade, "evaluate_relation", event="missing_history_slot",
+    response = _request(facade, "expand_one_owned_ref", event="missing_history_slot",
                         facts={"question": question, "missing_slot": question, "candidates": candidates,
                                "visible_refs": list(visible), "recovery_budget": 1,
                                "already_visible": False,
                                "explicit_ref_available": slot.get("explicit_ref_available"),
-                               "scope": engine.current_session_id},
+                               "scope": engine.current_session_id,
+                               "temporal_contract": slot.get("temporal_contract")},
                         completeness={"archive_complete": False}, deadline=deadline)
-    if response is None or response.get("relation") != "states_missing_decision":
+    if response is None:
+        return None
+    if response.get("relation") != "states_missing_decision":
+        acknowledge(facade, response)
         return None
     selected = response.get("candidate_id")
     if not isinstance(selected, str) or selected not in rows:
+        acknowledge(facade, response)
         return None
     store_id, start, before = rows[selected]
+    if slot.get("temporal_contract") == "historical_source_v1" and facade.history_source_absent(
+            selected, before["content"]) is not True:
+        acknowledge(facade, response)
+        return None
     # Revalidate live owner scope and exact source bytes after the judgment.
     if (time.monotonic() >= deadline
             or before.get("session_id") not in set(_recent_conversation_scope_session_ids(engine))
             or engine._store.get(store_id) != before):
+        acknowledge(facade, response)
         return None
     with _RECOVERY_LOCK:
         recovered = getattr(engine, "_supervision_recovered_slots", set())
         if key in recovered or len(recovered) >= 32:
+            acknowledge(facade, response)
             return None
         engine._supervision_recovered_slots = recovered | {key}
-    result = json.loads(lcm_expand({"store_id": store_id, "content_offset": start,
-                                   "max_tokens": 600, "include_exact_ref": True}, engine=engine))
+    try:
+        result = json.loads(lcm_expand({"store_id": store_id, "content_offset": start,
+                                       "max_tokens": 600, "include_exact_ref": True}, engine=engine))
+    except Exception:
+        acknowledge(facade, response)
+        return None
     if (time.monotonic() >= deadline or result.get("session_id") != before["session_id"]
             or result.get("role") != before.get("role") or "error" in result
-            or result.get("content") != (before.get("content") or "")[start:start + len(result.get("content", ""))]):
+            or result.get("content") != before.get("content")
+            or result.get("exact_ref") != selected
+            or result.get("content_offset") != start
+            or result.get("content_returned_chars") != len(before.get("content", ""))
+            or result.get("conversation_id", "") != (before.get("conversation_id") or "")
+            or result.get("source", "") != (before.get("source") or "")
+            or engine._store.get(store_id) != before
+            or before["session_id"] not in set(_recent_conversation_scope_session_ids(engine))):
+        acknowledge(facade, response)
         return None
     # The ordinary exact-history reader owns bytes, role, lineage and offsets.
-    return result
+    return result if acknowledge(facade, response, result) else None

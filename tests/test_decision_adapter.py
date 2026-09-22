@@ -18,7 +18,7 @@ from hermes_lcm.store import MessageStore
 class DelayedFacade:
     def negotiate(self, version):
         return {"version": version, "supported": True,
-                "owner_capabilities": ["rank_candidates", "select_windows", "evaluate_relation"]}
+                "owner_capabilities": ["rank_candidates", "select_windows", "expand_one_owned_ref"]}
 
     def __init__(self, delay=.015, alter=None):
         self.delay, self.alter, self.requests = delay, alter, []
@@ -30,7 +30,7 @@ class DelayedFacade:
         answer = {"request_id": request["request_id"], "candidate_ids": ids, "conflict_ids": ids[:1]}
         return self.alter(answer) if self.alter else answer
 
-    def evaluate_relation(self, request):
+    def expand_one_owned_ref(self, request):
         self.requests.append(copy.deepcopy(request))
         time.sleep(self.delay)
         answer = {"request_id": request["request_id"],
