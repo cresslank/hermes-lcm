@@ -4528,6 +4528,7 @@ def _lcm_recall_rerank(
     supervision: Any = None,
     scope: dict | None = None,
     completeness: dict | None = None,
+    engine: Any = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Optionally REORDER the top ``window`` fused candidates in ONE API call.
 
@@ -4548,7 +4549,7 @@ def _lcm_recall_rerank(
         ranked = rank_candidates(
             supervision, query, ordered, window=window,
             deadline=admission_deadline(deadline), scope=scope or {},
-            completeness=completeness or {},
+            completeness=completeness or {}, engine=engine,
         )
         # One rank owner: never chain Voyage after a semantic abstention/timeout.
         return ranked, ("applied" if ranked is not ordered else "disabled")
@@ -4931,7 +4932,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     #    window of the post-prior order (no score splicing onto the RRF scale). --
     ordered, rerank_status = _lcm_recall_rerank(
         provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config,
-        supervision=getattr(engine, "supervision", None),
+        supervision=getattr(engine, "supervision", None), engine=engine,
         scope={"session_scope": "all", "current_session_id": engine.current_session_id},
         completeness={"retrieval_coverage": coverage, "archive_complete": False},
     )

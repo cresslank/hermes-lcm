@@ -133,7 +133,7 @@ def test_absent_capability_retains_voyage_and_serialized_baseline():
 
 
 def test_real_recall_consumer_preserves_exact_refs_roles_coverage(engine):
-    for text in ("Claim alpha accepted", "Claim beta accepted", "Claim gamma accepted"):
+    for text in (f"Claim {i} accepted" for i in range(10)):
         engine._store.append("current", {"role": "user", "content": text})
     args = {"query": "Claim", "detail": "answer_ready", "limit": 3, "seen_refs": []}
     baseline = json.loads(tools.lcm_recall(args, engine=engine))
@@ -141,8 +141,8 @@ def test_real_recall_consumer_preserves_exact_refs_roles_coverage(engine):
     start = time.monotonic()
     actual = json.loads(tools.lcm_recall(args, engine=engine))
     assert time.monotonic() - start < .15
-    assert [x["store_id"] for x in actual["hits"]] == [x["store_id"] for x in baseline["hits"]][::-1]
-    assert {x["exact_ref"] for x in actual["hits"]} == {x["exact_ref"] for x in baseline["hits"]}
+    assert actual["hits"][0]["store_id"] != baseline["hits"][0]["store_id"]
+    assert all(x["exact_ref"].startswith(f"lcm:{x['store_id']}:") for x in actual["hits"])
     assert {x["role"] for x in actual["hits"]} == {"user"}
     assert actual["provenance"]["rerank"] == "applied"
     actual["provenance"]["rerank"] = baseline["provenance"]["rerank"]
@@ -185,7 +185,9 @@ def slot(engine, session="current"):
     text = "User decided to keep the existing protocol."
     store_id = engine._store.append(session, {"role": "user", "content": text})
     return {"slot_id": "missing-protocol", "question": "What protocol was decided?", "expansion_budget": 1,
-            "visible_refs": [], "hits": [{"exact_ref": f"lcm:{store_id}:0-{len(text)}", "excerpt": text}]}
+            "explicit_ref_available": False,
+            "visible_refs": [], "hits": [{"exact_ref": f"lcm:{store_id}:0-{len(text)}", "excerpt": text,
+                                          "current": True, "superseded": False}]}
 
 
 def test_one_existing_history_expansion_no_retrieval(engine, monkeypatch):
@@ -234,3 +236,38 @@ def test_exact_history_hook_consumer_and_absent_byte_parity(engine):
     result = entry._pre_llm_context(engine, "policy", payload)
     assert missing["hits"][0]["excerpt"] in result["context"]
     assert entry._pre_llm_context(engine, "policy", {}) == {"context": "policy"}
+
+
+@pytest.mark.parametrize("field", ["current", "superseded", "explicit_ref_available"])
+def test_unknown_history_owner_facts_fail_before_decision(engine, field):
+    missing = slot(engine)
+    engine.supervision = DelayedFacade(0)
+    if field == "explicit_ref_available":
+        missing.pop(field)
+    else:
+        missing["hits"][0].pop(field)
+    assert adapter.recover_missing_history(engine, missing, deadline=time.monotonic() + .15) is None
+    assert not engine.supervision.requests
+
+
+def test_small_rank_batch_is_not_a_triage_opportunity():
+    incoming, facade = entries()[:3], DelayedFacade(0)
+    assert rank(facade, incoming)[0] is incoming
+    assert not facade.requests
+
+
+def test_source_projection_hydrates_whole_native_row_not_fts_markup(engine):
+    incoming = []
+    for i in range(10):
+        text = f"Claim {i}; qualifying limitation."
+        sid = engine._store.append("current", {"role": "user", "content": text})
+        incoming.append({"hit": {"kind": "message_excerpt", "store_id": sid, "session_id": "current",
+                                  "role": "user", "snippet": f"[Claim] {i}"}, "_final_score": i})
+    facade = DelayedFacade(0)
+    result = adapter.rank_candidates(facade, "Claim", incoming, window=8, engine=engine,
+                                     scope={"session_scope": "all"}, completeness={}, deadline=time.monotonic() + .15)
+    assert result[:8] == incoming[:8][::-1] and result[8:] == incoming[8:]
+    facts = facade.requests[0]["facts"]
+    assert all(c["qualifiers_complete"] is True and c["constraints_match"] is True for c in facts["candidates"])
+    assert all("qualifying limitation" in c["excerpt"] for c in facts["candidates"])
+    assert incoming[0]["hit"]["snippet"] == "[Claim] 0"

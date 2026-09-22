@@ -64,3 +64,31 @@ must resolve runtime context per invocation; it must not capture registration-
 time agent state. This owner contract requires host mapping conversion and
 active owner-capability negotiation; typed host records alone are not a mapping
 adapter. End-to-end host/provider activation is a separate integration gate.
+
+## Native domain projection
+
+The native facade advertises `owner_deadline=True`: call it on the authenticated
+execution thread, not a private worker. It owns the single original <=150 ms
+round token and schedules provider I/O elsewhere. Native local observation needs
+`history_excerpt`; remote disclosure separately requires explicitly configured
+per-field/source policy. Neither the adapter nor source text grants disclosure.
+
+F14 emits canonical `id`, `ref`, `version`, `provenance`, `baseline_ids`,
+`needs_triage`, `exact_answer_complete` and candidate facts. A batch fitting the
+8-candidate evidence head is not itself a triage opportunity. For an existing
+message candidate, LCM may hydrate its whole native row only when <=1200 chars,
+with matching session and role; it rechecks the row before returning the view.
+This proves no source qualifiers were clipped, not truth/freshness. Retrieval
+scope (`all` or matching `current`) establishes the retrieval constraint only;
+it never certifies semantic entity/date agreement. Other snippets remain unknown.
+The owner does not have an already-certified complete answer at this retrieval
+stage; downstream exact/finite-coverage/computation validators remain unchanged.
+
+F15 now additionally requires **host-owned** slot `explicit_ref_available=False`
+and each hit's explicit `current=True`, `superseded=False`. These are not inferred
+from stored text, age, exact-ref validity or absence of truncation. Unknown facts
+abstain before judgment. Complete bounded native-row excerpts establish only
+excerpt integrity; the host still owns the currency/supersession assertion.
+The native engine must implement the `expand_one_owned_ref` -> `evaluate_relation`
+codec with the selected singleton ID and `states_missing_decision`; otherwise no
+expansion is claimed. No automatic producer of missing-slot currency is added.
