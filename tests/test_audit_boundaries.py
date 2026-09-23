@@ -36,6 +36,11 @@ from pathlib import Path
 import sqlite3
 import sys
 from types import SimpleNamespace
+# Standalone plugin CI provides only the ContextEngine ABC, not Hermes's real
+# registration ledger. Skip only an absent host, never a broken installed one.
+if importlib.util.find_spec("hermes_cli") is None:
+    print(json.dumps({"skip": "real Hermes host is not installed"}))
+    raise SystemExit(0)
 import hermes_cli.plugins as host
 repo = Path(sys.argv[1])
 spec = importlib.util.spec_from_file_location("lcm_real_ledger_probe", repo / "__init__.py", submodule_search_locations=[str(repo)])
@@ -92,6 +97,8 @@ finally:
 '''
     result = run_isolated_python(script, tmp_path, Path(__file__).resolve().parent.parent)
     payload = json.loads(result.stdout.strip().splitlines()[-1])
+    if payload.get("skip") == "real Hermes host is not installed":
+        pytest.skip(payload["skip"])
     assert payload["unloaded"] and payload["prototype_closed"]
     assert payload["clone_rows_after_unload"] == 1
     assert payload["real_host"].endswith("/hermes_cli/plugins.py")

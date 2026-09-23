@@ -47,6 +47,10 @@ def _deny_test_network(event, args):
         raise RuntimeError("isolated Python probe forbids network")
 sys.addaudithook(_deny_test_network)
 import runpy
+# Match the parent pytest process's checkout import root. CI places its minimal
+# agent.context_engine stub here; the isolated cwd and scrubbed PYTHONPATH must
+# not make that explicit fixture disappear in a fresh interpreter.
+sys.path.insert(0, {str(conftest.parent.parent)!r})
 guard = runpy.run_path({str(conftest)!r}, run_name="_lcm_child_test_guard")
 # A plain Python probe has no pytest lifecycle. Register exactly this helper's
 # owned root through the SAME scratch-only predicate as the parent pytest run.
