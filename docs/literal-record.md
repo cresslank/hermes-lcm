@@ -115,10 +115,40 @@ pairs with canonical JSON values. Native metadata nulls remain null. The row
 hash pins the fields listed by `literal_record.ROW_FIELDS`; native attribution
 is separately bounded to 4096 bytes. Hashes provide integrity, not truth.
 
-These are bounded in-memory, invocation/revision/deadline-bound prerequisites,
-not durable accepted claims. F22 still needs the host adoption/dependency graph,
-comparison/action codecs, correction policy and real sink emission joins. It is
-not complete merely because original source records can now be published.
+These publication objects remain invocation/revision/deadline-bound prerequisites,
+not durable accepted claims. A newer host may separately opt into the closed
+`literal_sources.final_use` policy with exactly `version:
+supervision.literal-final-use.v1`, `consumer: native:accepted-final`, and
+`enabled: true`. Existing source/observation/history grants do not imply it.
+
+`literal_source_final.FinalSourceOwner` extends the same registered provider,
+not its publication lifetime. It retains only opaque selections of rows already
+captured by real pack/auto/proposal tools and linked by the host to an exact
+committed claim-use declaration. Selections bind native consumer, engine/store,
+session/lifecycle, work/turn/instruction/requirement/catalog/control generations
+and exact canonical predecessor fingerprint. The combined publication,
+selection and final-permission capacity remains 64. Only evidence bookkeeping
+can be crossed; source lifecycle transitions erase the new purpose too.
+
+At the host's actual accepted-final phase, the provider consumes the selection
+once, performs a zero-busy-wait read-only point read of that selected row, and
+revalidates full bytes/span/attribution/numeric coordinates before granting a
+short-lived native-local permission. No model-provided row ID, raw resolver
+bypass, search, source-body persistence, changed inference deadline or new
+retrieval is involved. Missing databases are not created. The source read is
+outside host/provider/write locks; final lifecycle/phase checks are repeated at
+canonical acceptance. Permission loss/optional faults preserve ordinary output.
+No cross-database atomic exclusion of arbitrary external row tampering after
+this read, hard filesystem latency bound, emission or source truth is promised.
+
+The host accepts only one reversible whole-record final exactly equal to the
+current dedicated claim artifact (at most 2,400 characters), with no surrounding
+quotes, negation/rejection, mixed prose or repetition. It records `adopted` in
+its existing canonical owner-record family, not in LCM. Ordinary v1 publication
+still becomes unavailable at batch completion or original deadline expiry.
+No selection/permission survives turn end, cancellation, instruction change,
+owner/lifecycle replacement or restart. This is not full F22: mandatory-answer
+relevance, adopted-claim correction joins and actual sink emission remain open.
 
 ## Tests
 

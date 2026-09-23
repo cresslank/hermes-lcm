@@ -49,11 +49,15 @@ def install_literal_source_owner(engine, facade):
         # Older v1 hosts cannot fence lifecycle generations; keep ordinary tools.
         return None
 
-    class Provider(LiteralSourceProviderV1):
+    from .literal_source_final import FinalSourceOwner
+
+    class Provider(FinalSourceOwner, LiteralSourceProviderV1):
         def __init__(self):
             self.engines = weakref.WeakKeyDictionary({engine: (engine._store, engine._hermes_home, engine._config.database_path)})
             self.bindings = weakref.WeakKeyDictionary({engine: _Binding()})
             self.records = {}
+            self.final_selections = set()
+            self.final_permissions = set()
             self.invocations = set()
             self.lock = threading.RLock()
 
@@ -83,6 +87,7 @@ def install_literal_source_owner(engine, facade):
             with self.lock:
                 state = self.bindings[candidate]
                 state.generation = object()  # irreversible even for A -> B -> A
+                self.invalidate_final_sources(candidate)
                 state.transitions += 1
                 state.ready = False
             succeeded = False
@@ -115,7 +120,7 @@ def install_literal_source_owner(engine, facade):
                         or self.literal_source_binding(capture.engine) != capture.invocation.binding):
                     capture.overflow = True
                     return
-                if len(capture.refs) >= 8 or len(self.records) >= 64:
+                if len(capture.refs) >= 8 or self.final_capacity() >= 64:
                     capture.overflow = True
                     return
                 ref = uuid.uuid4().hex

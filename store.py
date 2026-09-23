@@ -681,6 +681,24 @@ class MessageStore:
         finally:
             self._write_lock.release()
 
+    def _get_for_local_final(self, store_id: int) -> Optional[Dict[str, Any]]:
+        """One selected-row read, no writer lock/wait or database creation.
+
+        Final-use authority belongs to the registered literal owner, not this
+        storage primitive. Use a separate read-only connection rather than
+        changing the ordinary connection's busy timeout or transaction state.
+        """
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0)
+        try:
+            row = conn.execute(
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ? "
+                "AND length(CAST(content AS BLOB)) BETWEEN 1 AND 2400", (store_id,)
+            ).fetchone()
+            return self._row_to_dict(row) if row else None
+        finally:
+            conn.close()
+
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
 
