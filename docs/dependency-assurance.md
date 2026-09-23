@@ -25,6 +25,37 @@ Ed25519 fixture generation. It is imported only when that scenario runs, never
 by ordinary plugin loading. CI and the documented test setup install it; missing
 support fails the scenario rather than skipping redaction coverage.
 
+## Optional native supervision APIs
+
+The `agent` module remains required for the baseline plugin. Its API inventory
+also includes feature-scoped host integrations already used by the runtime:
+
+- `literal_source.py` imports `LiteralSourceProviderV1` and
+  `LiteralSourceRecordV1` only when a supervision facade is supplied. Missing
+  imports, a missing `literal_source_binding_fence`, or a missing facade
+  registration method leave native publication unregistered.
+- `literal_source_final.py` consumes `NativeFinalUse`, `_FinalPhase`, and
+  `selection_scope` inside registered source-owner callbacks.
+- `literal_source_correction.py` consumes `_Attempt`, `Review`, `enabled`,
+  `source_for`, `candidate_received`, `get_active_subagent_parent`, and
+  `comparable`; `literal_source_events.py` also consumes `comparable` and
+  `source_event_received`. These imports support native correction custody,
+  candidate hydration, and postcommit source-event delivery.
+- `decision_adapter.py` negotiates retrieval presentation using `VERSION` and
+  `negotiated`, then consumes `validate` and `annotate` only for that output
+  contract. Missing negotiation imports retain order-only behavior; presentation
+  or settlement failures return the ordinary shaped baseline.
+
+Final-use and correction imports are not individually guarded by `ImportError`
+in their callbacks. A host enabling those features must supply the matching API
+set, including the private `_FinalPhase` and `_Attempt` types; the broad baseline
+host version range alone does not establish feature compatibility. Correction
+source-event preparation and postcommit delivery have separate exception guards
+so optional metadata or callback failures do not strand native source writes.
+The inventory was checked against host commit
+`bd6e7e754c6372007a93acf6573dc85d27253e09`; this is source-level compatibility
+evidence, not a claim that every supported host version supplies these APIs.
+
 ## Mechanical validation
 
 Run:

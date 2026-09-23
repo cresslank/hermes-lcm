@@ -49,10 +49,14 @@ def test_original_whole_record_bytes_and_immutable_coordinates(engine, role):
 @pytest.mark.parametrize("mutation", ["missing", "null", "unknown"])
 def test_missing_and_unknown_coordinates_abstain(engine, field, mutation):
     data = literal()
-    if mutation == "missing": del data[field]
-    elif mutation == "null": data[field] = None
-    elif field == "value": data[field] = {"model_guess": True}
-    else: data[field] = {"unknown": True}
+    if mutation == "missing":
+        del data[field]
+    elif mutation == "null":
+        data[field] = None
+    elif field == "value":
+        data[field] = {"model_guess": True}
+    else:
+        data[field] = {"unknown": True}
     text = json.dumps(data)
     assert validate_row(row(engine, text), 0, len(text)) is None
 
