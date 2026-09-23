@@ -509,8 +509,12 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
+            from .literal_source_events import prepare, committed
+            events = prepare(self, (cur.lastrowid,))
             self._conn.commit()
-            return cur.lastrowid
+            store_id = cur.lastrowid
+        committed(events)
+        return store_id
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -578,6 +582,9 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+            from .literal_source_events import prepare, committed
+            events = prepare(self, ids)
+        committed(events)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
@@ -595,13 +602,16 @@ class MessageStore:
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
+            from .literal_source_events import prepare, committed
+            events = prepare(self, unavailable_session=session_id)
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
             self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
-            return deleted
+        committed(events)
+        return deleted
 
     def gc_externalized_tool_result(
         self,

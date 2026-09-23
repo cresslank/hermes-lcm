@@ -51,13 +51,19 @@ def install_literal_source_owner(engine, facade):
 
     from .literal_source_final import FinalSourceOwner
 
-    class Provider(FinalSourceOwner, LiteralSourceProviderV1):
+    from .literal_source_correction import CorrectionSourceOwner
+
+    class Provider(CorrectionSourceOwner, FinalSourceOwner, LiteralSourceProviderV1):
         def __init__(self):
             self.engines = weakref.WeakKeyDictionary({engine: (engine._store, engine._hermes_home, engine._config.database_path)})
             self.bindings = weakref.WeakKeyDictionary({engine: _Binding()})
             self.records = {}
             self.final_selections = set()
             self.final_permissions = set()
+            self.correction_custody = {}
+            self.correction_candidates = {}
+            self.correction_events = {}
+            engine._store._literal_correction_provider = self
             self.invocations = set()
             self.lock = threading.RLock()
 
@@ -107,6 +113,7 @@ def install_literal_source_owner(engine, facade):
                 self.engines[clone] = (clone._store, clone._hermes_home, clone._config.database_path)
                 self.bindings[clone] = _Binding()
                 clone._literal_source_provider = self
+                clone._store._literal_correction_provider = self
 
         def capture(self, capture, row, start, end):
             record = validate_row(row, start, end)
@@ -205,6 +212,9 @@ def literal_source_lifecycle(function):
 
 
 def observe_hydrated(engine, row, start, end):
+    provider = getattr(engine, "_literal_source_provider", None)
+    if provider is not None:
+        provider.capture_correction_candidate(engine, row, start, end)
     capture = _active.get()
     if capture is not None and capture.engine is engine and not capture.overflow:
         capture.provider.capture(capture, row, start, end)
