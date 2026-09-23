@@ -34,6 +34,10 @@ LCM_GREP = {
                     "Wrap exact phrases in quotes. Short CJK fragments and emoji-heavy queries may use substring fallback instead of plain FTS token matching."
                 ),
             },
+            "missing_decision": {
+                "type": "string", "maxLength": 1200,
+                "description": "Optional explicit missing historical decision. Current/history scope only: permits one bounded expansion of this search's supplied hits under host policy; no extra search or present-truth claim. If an exact ref is known, use lcm_expand directly.",
+            },
             "limit": {
                 "type": "integer",
                 "description": (

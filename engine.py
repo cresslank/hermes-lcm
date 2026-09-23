@@ -114,6 +114,7 @@ from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
+from .literal_source import literal_source_lifecycle
 from .message_content import (
     normalize_content_value,
     stored_text_content_for_pattern_matching,
@@ -629,6 +630,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
         )
+        clone.supervision = getattr(self, "supervision", None)
+        literal_provider = getattr(self, "_literal_source_provider", None)
+        if literal_provider is not None:
+            literal_provider.bind_clone(self, clone)
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key
@@ -2602,6 +2607,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_active_placeholder_digest_ordinals = boundary_placeholder_ordinals
         self._log_session_filter_diagnostics()
 
+    @literal_source_lifecycle
     def on_session_start(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
@@ -3224,6 +3230,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             conversation_id=conversation_id,
         )
 
+    @literal_source_lifecycle
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
@@ -3553,6 +3560,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return
             raise
 
+    @literal_source_lifecycle
     def on_session_reset(self) -> None:
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
@@ -6624,6 +6632,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Lifecycle ---------------------------------------------------------
 
+    @literal_source_lifecycle
     def shutdown(self):
         self._unregister_active_engine_binding()
         if self._adaptive_retrieval is not None:

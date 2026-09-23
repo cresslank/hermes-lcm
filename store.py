@@ -358,7 +358,12 @@ class MessageStore:
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
+        # Bind once around the native open. A later backup at the same pathname
+        # is not this store, even when all selected row bytes match.
+        self._local_final_identity = self._local_final_file_identity()
         self._init_db()
+        if self._local_final_file_identity() != self._local_final_identity:
+            self._local_final_identity = None
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
@@ -504,8 +509,12 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
+            from .literal_source_events import prepare, committed
+            events = prepare(self, (cur.lastrowid,))
             self._conn.commit()
-            return cur.lastrowid
+            store_id = cur.lastrowid
+        committed(events)
+        return store_id
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -573,6 +582,9 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+            from .literal_source_events import prepare, committed
+            events = prepare(self, ids)
+        committed(events)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
@@ -590,13 +602,16 @@ class MessageStore:
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
+            from .literal_source_events import prepare, committed
+            events = prepare(self, unavailable_session=session_id)
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
             self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
-            return deleted
+        committed(events)
+        return deleted
 
     def gc_externalized_tool_result(
         self,
@@ -664,6 +679,65 @@ class MessageStore:
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
+
+    def get_for_working_premise(self, store_id: int) -> Optional[Dict[str, Any]]:
+        """Zero-wait read on the registered connection, never a pathname reopen.
+
+        This optional use must not observe a pending native write or wait behind
+        one. Keep SQLite's ordinary timeout unchanged outside the short read.
+        """
+        if not self._write_lock.acquire(blocking=False):
+            return None
+        try:
+            if self._conn is None or self._conn.in_transaction:
+                return None
+            with _temporary_sqlite_busy_timeout([self._conn], 0):
+                return self.get(store_id)
+        finally:
+            self._write_lock.release()
+
+    def _local_final_file_identity(self) -> tuple[int, int] | None:
+        """Descriptor-free POSIX identity; unsupported/ambiguous files abstain.
+
+        Never open/close a raw file descriptor to probe SQLite's inode: closing
+        one can release the process's locks held by the ordinary connection.
+        """
+        if self._is_memory_database or os.name != "posix":
+            return None
+        try:
+            info = self.db_path.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_ino:
+            return None
+        return info.st_dev, info.st_ino
+
+    def _get_for_local_final(self, store_id: int) -> Optional[Dict[str, Any]]:
+        """One selected-row read, no writer lock/wait or database creation.
+
+        Final-use authority belongs to the registered literal owner, not this
+        storage primitive. Use a separate read-only connection rather than
+        changing the ordinary connection's busy timeout or transaction state.
+        Match its pathname to the store's opening identity before and after the
+        read; never rebind to a replacement. This assumes the existing private
+        directory contract, not atomicity against arbitrary filesystem actors
+        swapping files away and back within a read or rewriting files in place.
+        """
+        identity = self._local_final_identity
+        if self._conn is None or identity is None or self._local_final_file_identity() != identity:
+            return None
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0)
+        try:
+            row = conn.execute(
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ? "
+                "AND length(CAST(content AS BLOB)) BETWEEN 1 AND 2400", (store_id,)
+            ).fetchone()
+            if self._local_final_file_identity() != identity:
+                return None
+            return self._row_to_dict(row) if row else None
+        finally:
+            conn.close()
 
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.

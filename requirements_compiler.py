@@ -337,6 +337,8 @@ def _normalize_ref(raw: Any, *, engine: Any, origin: str) -> dict[str, Any] | No
         start, end, quote = declared_start, declared_end, window
     if not quote or _SECRET_RE.search(quote):
         return None
+    from .literal_record import observe_hydrated
+    observe_hydrated(engine, row, start, end)
     observed = row.get("observed_at")
     try:
         observed_epoch = float(observed) if observed is not None else None

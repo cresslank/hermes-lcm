@@ -1213,8 +1213,10 @@ def test_plugin_metadata_refreshes_when_manifest_changes(tmp_path, monkeypatch):
     import hermes_lcm.runtime_identity as identity_mod
 
     repo_root = Path(identity_mod.__file__).resolve().parent
-    manifest = repo_root / "plugin.yaml"
-    original = manifest.read_text(encoding="utf-8")
+    original = (repo_root / "plugin.yaml").read_text(encoding="utf-8")
+    manifest = tmp_path / "plugin.yaml"
+    manifest.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(identity_mod, "_PLUGIN_ROOT", tmp_path)
 
     monkeypatch.setattr(identity_mod, "_PLUGIN_METADATA", None)
 
@@ -1244,8 +1246,10 @@ def test_plugin_metadata_defaults_when_manifest_missing_before_first_read(tmp_pa
     import hermes_lcm.runtime_identity as identity_mod
 
     repo_root = Path(identity_mod.__file__).resolve().parent
-    manifest = repo_root / "plugin.yaml"
-    original = manifest.read_text(encoding="utf-8")
+    original = (repo_root / "plugin.yaml").read_text(encoding="utf-8")
+    manifest = tmp_path / "plugin.yaml"
+    manifest.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(identity_mod, "_PLUGIN_ROOT", tmp_path)
 
     monkeypatch.setattr(identity_mod, "_PLUGIN_METADATA", None)
 
