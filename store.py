@@ -665,6 +665,22 @@ class MessageStore:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
+    def get_for_working_premise(self, store_id: int) -> Optional[Dict[str, Any]]:
+        """Zero-wait read on the registered connection, never a pathname reopen.
+
+        This optional use must not observe a pending native write or wait behind
+        one. Keep SQLite's ordinary timeout unchanged outside the short read.
+        """
+        if not self._write_lock.acquire(blocking=False):
+            return None
+        try:
+            if self._conn is None or self._conn.in_transaction:
+                return None
+            with _temporary_sqlite_busy_timeout([self._conn], 0):
+                return self.get(store_id)
+        finally:
+            self._write_lock.release()
+
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
 

@@ -147,6 +147,25 @@ def install_literal_source_owner(engine, facade):
                     return None
                 return LiteralSourceRecordV1(**vars(original))
 
+        def working_literal_source(self, candidate, exact_ref):
+            # This purpose is request-bound, not another publication lifetime.
+            from .decision_adapter import _EXACT
+            match = _EXACT.fullmatch(exact_ref) if type(exact_ref) is str else None
+            binding = self.literal_source_binding(candidate)
+            if match is None or binding is None:
+                return None
+            sid, start, end = map(int, match.groups())
+            try:
+                row = candidate._store.get_for_working_premise(sid)
+            except (sqlite3.Error, OSError):
+                return None
+            if row is None or row.get("session_id") != candidate.current_session_id:
+                return None
+            record = validate_row(row, start, end)
+            if record is None or self.literal_source_binding(candidate) != binding:
+                return None
+            return LiteralSourceRecordV1(**vars(record))
+
         def release_literal_sources(self, invocation_id):
             with self.lock:
                 self.invocations.discard(invocation_id)
