@@ -986,6 +986,7 @@ class CompactionMixin:
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
         self._ingest_cursor_needs_reconcile = False
+        self._record_compaction_source(messages)
 
         logger.info(
             "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",

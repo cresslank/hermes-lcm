@@ -452,6 +452,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        self._last_compaction_source = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -1621,7 +1622,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     messages,
                     conversation_id=self._conversation_id,
                 )
-                self._ingest_messages(messages)
+                compaction_source_suffix = self._compaction_source_suffix(self._session_id, messages)
+                if compaction_source_suffix is not None:
+                    # A hook still holding the pre-compaction transcript: only
+                    # messages appended after it are new.
+                    if compaction_source_suffix:
+                        self._ingest_compaction_source_suffix(messages)
+                else:
+                    self._ingest_messages(messages)
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
@@ -2828,6 +2836,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
+        if (
+            boundary_reason == "compression"
+            and old_session_id == session_id
+            and session_id == previous_session_id
+            and not self._session_ignored
+            and not self._session_stateless
+            and not self._thread_context_stateless()
+        ):
+            # In-place compaction keeps the session id. compress() already
+            # stored the transcript and left the cursor at the end of the
+            # compacted context the host continues from; treating this edge as
+            # a fresh session would zero the cursor and re-store the fresh tail.
+            # Rebinding the same session is idempotent and re-opens lifecycle
+            # state if an earlier observer finalized it.
+            self._apply_session_start_metadata(session_id, kwargs)
+            self._bind_lifecycle_state(
+                session_id,
+                conversation_id=kwargs.get("conversation_id") or self._conversation_id,
+            )
+            self._log_session_filter_diagnostics()
+            return
+
         if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
             explicit_parent_id = str(kwargs.get("parent_session_id") or "")
             preserve_foreground_reuse_marker = bool(
@@ -3498,6 +3528,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             return
+        compaction_source_suffix = (
+            self._compaction_source_suffix(session_id, messages)
+            if session_id == self._session_id
+            else None
+        )
+        if compaction_source_suffix is not None:
+            # Hermes commits a compaction by handing the pre-compaction
+            # transcript to session-end observers (commit_memory_session) after
+            # compress() already stored it and moved the cursor to the shorter
+            # compacted context. Ingesting it again here would re-store every
+            # message past that cursor. The session is not ending: in-place
+            # compaction keeps it bound and rotation finalizes it at the
+            # compression boundary, so only genuinely new messages are stored.
+            if compaction_source_suffix:
+                self._ingest_compaction_source_suffix(messages)
+            return
         try:
             with _temporary_sqlite_busy_timeout(
                 [
@@ -3521,7 +3567,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     if _is_sqlite_locked_error(exc):
                         logger.warning(
                             "LCM session-end raw-message ingest skipped due to SQLite lock after short wait; "
-                            "final messages may be absent from the plugin-local store: %s",
+                            "the host transcript keeps these messages and LCM recovers them if the session "
+                            "resumes: %s",
                             exc,
                         )
                         return

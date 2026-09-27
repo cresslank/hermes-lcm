@@ -256,6 +256,28 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
+
+
+def _session_scope_named_session(engine, args: dict) -> str:
+    """Return a stored session id that a caller passed as ``session_scope``.
+
+    Models sometimes write ``session_scope="<session id>"`` instead of
+    ``session_scope="session", session_id="<session id>"``. Honour that only
+    when the value names a session with stored messages and no conflicting
+    ``session_id`` was given; anything else keeps the documented fallback.
+    """
+    raw_scope = str(args.get("session_scope") or "").strip()
+    if not raw_scope or raw_scope.lower() in _LCM_GREP_VALID_SCOPES:
+        return ""
+    explicit = str(args.get("session_id") or "").strip()
+    if explicit and explicit != raw_scope:
+        return ""
+    try:
+        if engine._store.get_session_count(raw_scope) > 0:
+            return raw_scope
+    except Exception:
+        logger.debug("lcm_grep session_scope session lookup failed", exc_info=True)
+    return ""
 _LCM_GREP_VALID_CONTENT_SCOPES = frozenset({"history", "externalized", "both"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_GREP_EXTERNALIZED_FILE_CAP = 256
@@ -2414,6 +2436,9 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
             if ref not in externalized_refs:
                 externalized_refs.append(ref)
 
+    named_scope_session_id = _session_scope_named_session(engine, args)
+    if named_scope_session_id:
+        args = {**args, "session_scope": "session", "session_id": named_scope_session_id}
     requested_session_scope = str(args.get("session_scope", "current")).lower()
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
@@ -2760,6 +2785,11 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
         response["externalized_results_omitted"] = True
     if session_scope == "session":
         response["session_id"] = explicit_session_id
+    if named_scope_session_id:
+        response["scope_note"] = (
+            "session_scope named a stored session; searched it as "
+            "session_scope=session with that session_id."
+        )
     if requested_limit > limit_cap:
         response["limit_clamped_from"] = requested_limit
     if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
@@ -3077,6 +3107,9 @@ def _lcm_grep_semantic(
     limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
     knn_limit = candidate_limit if candidate_limit is not None else limit
 
+    named_scope_session_id = _session_scope_named_session(engine, args)
+    if named_scope_session_id:
+        args = {**args, "session_scope": "session", "session_id": named_scope_session_id}
     requested_session_scope = str(args.get("session_scope", "current")).lower()
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
@@ -3327,6 +3360,11 @@ def _lcm_grep_semantic(
         response["time_to"] = time_to
     if session_scope == "session":
         response["session_id"] = explicit_session_id
+    if named_scope_session_id:
+        response["scope_note"] = (
+            "session_scope named a stored session; searched it as "
+            "session_scope=session with that session_id."
+        )
     if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
     if requested_session_scope not in _LCM_GREP_VALID_SCOPES:

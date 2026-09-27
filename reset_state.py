@@ -7,6 +7,8 @@ reset or rolled over. State stays on the engine (accessed via ``self``);
 mixing this in leaves every call site and ``self._*`` reference unchanged.
 """
 
+import hashlib
+import json
 import uuid
 
 
@@ -43,6 +45,7 @@ class ResetStateMixin:
         self._ingest_cursor = 0
         self._ingest_cursor_needs_reconcile = False
         self._last_ingest_reconciliation = {"action": "none", "reason": "not run"}
+        self._last_compaction_source = None
 
     def _reset_session_scoped_runtime_state(self) -> None:
         """Reset all session-scoped runtime state.
@@ -59,3 +62,57 @@ class ResetStateMixin:
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
+
+    def _compaction_source_digest(self, message) -> str:
+        identity = self._message_replay_identity(message)
+        return hashlib.sha256(
+            json.dumps(identity, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+
+    def _record_compaction_source(self, messages) -> None:
+        """Remember the transcript a successful compress() just consumed.
+
+        Hermes may deliver that same pre-compaction transcript to session-end
+        observers while it commits the compaction. Every row in it is already
+        durable, and the cursor now points into the compacted context, so it
+        must be recognised rather than ingested again. Only per-message
+        digests are kept, not message content.
+        """
+        self._last_compaction_source = (
+            str(self._session_id or ""),
+            [self._compaction_source_digest(message) for message in messages],
+        )
+
+    def _compaction_source_suffix(self, session_id, messages):
+        """Return the new tail of ``messages`` past the last compaction source.
+
+        ``None`` means ``messages`` is not a replay of the recorded source (the
+        normal ingest path applies). An empty list means it is exactly that
+        source. The prefix must match element by element; content that only
+        resembles earlier history is never skipped.
+        """
+        recorded = getattr(self, "_last_compaction_source", None)
+        if not recorded or recorded[0] != session_id or not messages:
+            return None
+        source_digests = recorded[1]
+        if not source_digests or len(messages) < len(source_digests):
+            return None
+        for digest, message in zip(source_digests, messages):
+            if self._compaction_source_digest(message) != digest:
+                return None
+        return list(messages[len(source_digests):])
+
+    def _ingest_compaction_source_suffix(self, messages) -> None:
+        """Store only the messages appended after the recorded compaction source."""
+        suffix_start = len(self._last_compaction_source[1])
+        saved_cursor = self._ingest_cursor
+        saved_reconcile = self._ingest_cursor_needs_reconcile
+        self._ingest_cursor = suffix_start
+        self._ingest_cursor_needs_reconcile = False
+        try:
+            self._ingest_messages(messages)
+        finally:
+            # The host continues from the compacted context, so keep the cursor
+            # positioned there; the next ingest resumes from the compacted list.
+            self._ingest_cursor = saved_cursor
+            self._ingest_cursor_needs_reconcile = saved_reconcile
