@@ -50,6 +50,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_SUMMARY_SCAFFOLD_NODE_RE = re.compile(
+    r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node (\d+)\)\]"
+)
 
 
 class ReconcileMixin:
@@ -445,6 +448,7 @@ class ReconcileMixin:
                     "tool_calls": decoded_tool_calls,
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
+        owned_summary_scaffold_index = self._last_owned_summary_scaffold_index(messages)
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
@@ -726,6 +730,16 @@ class ReconcileMixin:
                 and len(candidate_prefix) >= max(1, effective_fresh_tail_count)
                 and raw_suffix_needs_cleanup_equivalence
             )
+            # A compacted active context that opens with a summary node this
+            # session's DAG actually owns is LCM's own replay, not a fresh
+            # delta. Its fresh tail was stored before compaction, so a visible
+            # prefix that exactly matches the durable tail is already stored.
+            has_owned_summary_scaffold_replay = (
+                owned_summary_scaffold_index is not None
+                and cursor > owned_summary_scaffold_index
+                and has_persisted_marker_specific_replay_evidence
+                and (matches_sanitized_tail or matches_raw_tail)
+            )
             if (
                 has_effective_full_replay
                 or has_externalized_singleton_replay
@@ -737,9 +751,39 @@ class ReconcileMixin:
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
+                or has_owned_summary_scaffold_replay
             ):
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
+
+    def _last_owned_summary_scaffold_index(self, messages: List[Dict[str, Any]]) -> int | None:
+        """Index of the last replayed summary scaffold naming a node this session owns.
+
+        A summary header alone proves nothing (text can be copied or forged);
+        the named node must exist in the DAG under the bound session.
+        """
+        session_id = str(getattr(self, "_session_id", "") or "")
+        dag = getattr(self, "_dag", None)
+        if not session_id or dag is None:
+            return None
+        owned_index: int | None = None
+        ownership: dict[int, bool] = {}
+        for index, msg in enumerate(messages):
+            if not self._is_replayed_context_scaffold_message(msg):
+                continue
+            content = normalize_content_value(msg.get("content")) or ""
+            for match in _SUMMARY_SCAFFOLD_NODE_RE.finditer(content):
+                node_id = int(match.group(1))
+                if node_id not in ownership:
+                    try:
+                        node = dag.get_node(node_id)
+                    except Exception:
+                        node = None
+                    ownership[node_id] = bool(node is not None and node.session_id == session_id)
+                if ownership[node_id]:
+                    owned_index = index
+                    break
+        return owned_index
 
     def _record_ingest_reconciliation(
         self,

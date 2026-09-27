@@ -4,7 +4,20 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+### Fixed
+
+- In-place compaction no longer re-stores history. Hermes now compacts in
+  place (same session id) and then sends the pre-compaction transcript to
+  session-end observers and a same-id `compression` session start. LCM treated
+  both as a fresh session, zeroed its ingest cursor, and re-stored the fresh
+  tail and every message past the compacted context. A production store had
+  about 177,000 duplicate rows from this. LCM now keeps its cursor across the
+  same-id boundary, recognises the exact transcript it just compacted (by
+  per-message digest, content is not retained), and treats a compacted context
+  that opens with a summary node this session's DAG owns as its own replay.
+- `lcm_grep` accepts a stored session id passed as `session_scope` and searches
+  that session, reporting a `scope_note`. Unknown values keep the documented
+  fallback to the current session.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
