@@ -928,6 +928,25 @@ def extract_externalized_ref(text: str) -> str | None:
     return refs[0] if refs else None
 
 
+def extract_leading_externalized_ref(text: str) -> str | None:
+    """Return the ref only when the text itself starts with a placeholder.
+
+    A stored row or replayed message *is* an externalized payload when its
+    content opens with the placeholder. Tool results that merely quote a
+    placeholder (``lcm_load_session``, ``lcm_grep``, file reads of stored
+    transcripts) are ordinary content and must keep their own identity.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    match = _EXTERNALIZED_REF_RE.match(text.lstrip())
+    if match is None:
+        return None
+    ref = match.group(1).strip()
+    if not ref or "/" in ref or "\\" in ref or Path(ref).name != ref:
+        return None
+    return ref
+
+
 def extract_externalized_refs(text: str) -> list[str]:
     if not isinstance(text, str) or not text:
         return []
