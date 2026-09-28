@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from .externalize import (
     extract_externalized_ref,
+    extract_leading_externalized_ref,
     externalized_tool_result_has_persisted_output_marker,
     find_externalized_tool_result_content_for_call,
     load_externalized_payload,
@@ -228,7 +229,7 @@ class ReconcileMixin:
                 session_id=session_id,
             )
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
-        ref = extract_externalized_ref(content)
+        ref = extract_leading_externalized_ref(content)
         if ref and "quarantined_assistant_output" not in content:
             payload = load_externalized_payload(
                 ref,
@@ -275,7 +276,7 @@ class ReconcileMixin:
         if str(row.get("role") or "") != "tool":
             return False
         content = normalize_content_value(row.get("content")) or ""
-        ref = extract_externalized_ref(content)
+        ref = extract_leading_externalized_ref(content)
         if not ref:
             return False
         return externalized_tool_result_has_persisted_output_marker(
@@ -906,6 +907,34 @@ class ReconcileMixin:
             session_count=len(stored_tail),
             raw_session_count=session_count,
         )
+        if cursor is None or cursor <= 0 or not self._effective_replay_identities(messages[:cursor]):
+            # The exact-suffix proof covered no durable row. A host that
+            # rebuilt this history from its own transcript can still be
+            # replaying the durable tail with small, known differences.
+            aligned_cursor = self._aligned_durable_tail_replay_cursor(
+                messages,
+                stored_tail,
+                stored_tail_rows,
+            )
+            if aligned_cursor is not None and aligned_cursor > (cursor or 0):
+                self._record_ingest_reconciliation(
+                    action="advanced cursor",
+                    reason="aligned durable tail replay",
+                    cursor=aligned_cursor,
+                    incoming=len(messages),
+                    session_count=session_count,
+                    stored_tail_count=len(stored_tail),
+                    effective_incoming=len(self._effective_replay_identities(messages)),
+                )
+                logger.info(
+                    "LCM aligned restart replay with the durable tail: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d",
+                    self._session_id,
+                    aligned_cursor,
+                    len(messages),
+                    len(stored_tail),
+                    session_count,
+                )
+                return aligned_cursor
         if cursor is not None and cursor > 0:
             reason = (
                 "skipped scaffold-only prefix"
@@ -987,6 +1016,256 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return 0
+
+    # -- Aligned restart replay --------------------------------------------
+    #
+    # A host that rebuilds a session from its own transcript after a restart
+    # replays what LCM already stored, but not always byte-for-byte:
+    #
+    # * store-only rows (an orphan-recovery tool row, an earlier duplicate)
+    #   are absent from the host history;
+    # * the host keeps a text-only view of multimodal tool results that LCM
+    #   stored as JSON parts;
+    # * the host folds consecutive user turns, preserved task-list blocks and
+    #   late assistant sends into neighbouring messages, and LCM may hold a
+    #   user message inside a gateway-shutdown recovery note;
+    # * the host strips surrounding whitespace from user and assistant text.
+    #
+    # * the host holds a message LCM never stored (a failed ingest).
+    #
+    # Any one of these breaks the exact-suffix proof, and the whole replay was
+    # then persisted again on every restart. The aligner below proves replay
+    # instead by walking both sequences backwards from the durable end,
+    # matching exact identities and a closed set of equivalences, and it
+    # bridges a small number of one-sided rows. A skipped message always has
+    # a stored counterpart: the cursor stops at the first message LCM does not
+    # hold, and everything from there on is persisted as usual.
+
+    _ALIGNED_REPLAY_MIN_MATCHED = 8
+    _ALIGNED_REPLAY_MAX_ONE_SIDED = 6
+    _ALIGNED_REPLAY_ONE_SIDED_RATIO = 0.1
+
+    _ALIGNED_REPLAY_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+
+    @classmethod
+    def _aligned_replay_text(cls, content: str) -> str:
+        """Host transcript view of a stored multimodal payload.
+
+        Hermes persists multimodal tool results as text: text parts keep their
+        text and image parts become ``[screenshot]``, joined by newlines.
+        Returns the content unchanged when it is not a stored part list.
+        """
+        if not isinstance(content, str) or not content.startswith("["):
+            return content
+        try:
+            parts = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return content
+        if not isinstance(parts, list) or not parts:
+            return content
+        texts: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                return content
+            kind = part.get("type")
+            if kind == "text" or (kind is None and "text" in part):
+                text = part.get("text")
+                if not isinstance(text, str):
+                    return content
+                texts.append(text)
+            elif kind in cls._ALIGNED_REPLAY_IMAGE_PART_TYPES:
+                texts.append("[screenshot]")
+        if not texts:
+            return content
+        return "\n".join(texts)
+
+    @classmethod
+    def _aligned_replay_equivalent(
+        cls,
+        incoming: tuple[str, str, str, str],
+        stored: tuple[str, str, str, str],
+    ) -> bool:
+        """Whether a replayed message is the host's view of a stored row.
+
+        Role, tool-call id and tool calls must be identical. Content may differ
+        only by surrounding whitespace (the host strips user and assistant
+        text on load), by the host's text-only view of stored multimodal
+        parts, or by text one side added before or after the other at a line
+        boundary (a host fold, or a recovery note LCM stored around the
+        user's message). The shorter side must be non-empty.
+        """
+        if incoming == stored:
+            return True
+        if incoming[0] != stored[0] or incoming[2] != stored[2] or incoming[3] != stored[3]:
+            return False
+        a = incoming[1] or ""
+        b = stored[1] or ""
+        if incoming[0] == "tool" and incoming[2]:
+            stored_text = cls._aligned_replay_text(b)
+            if stored_text != b and stored_text.strip() == a.strip():
+                return True
+        a = a.strip()
+        b = b.strip()
+        if a == b:
+            return bool(a)
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        if not shorter:
+            return False
+        if longer.startswith(shorter) and longer[len(shorter):len(shorter) + 1] == "\n":
+            return True
+        if longer.endswith(shorter) and longer[-len(shorter) - 1:-len(shorter)] == "\n":
+            return True
+        return False
+
+    def _aligned_durable_tail_replay_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_tail: list[tuple[str, str, str, str]],
+        stored_tail_rows: list[Dict[str, Any]] | None,
+    ) -> int | None:
+        """Cursor past the longest prefix that replays the durable tail.
+
+        For each candidate end position whose message matches one of the last
+        stored rows, walks the replayable messages up to that position and the
+        stored tail backwards together. Exact or equivalent
+        pairs advance both sides. A mismatch is bridged by skipping one side
+        for up to two rows when the other side re-synchronises immediately.
+        A prefix is accepted only when the walk consumes every replayable
+        message up to its end, matches enough rows with both a user and an
+        assistant turn, and bridges only a small fraction of one-sided rows.
+        Among accepted prefixes the one bridging the fewest rows wins, and the
+        earlier one on a tie. Messages after it are persisted as usual.
+        Returns None when no prefix has that proof.
+        """
+        if not messages or not stored_tail:
+            return None
+        candidates: list[tuple[int, tuple[str, str, str, str], bool]] = []
+        for idx, msg in enumerate(messages):
+            if str(msg.get("role") or "") == "system":
+                continue
+            if self._is_replayed_context_scaffold_message(msg):
+                continue
+            if self._matches_ignore_message_patterns(msg):
+                continue
+            text = text_content_for_pattern_matching(msg.get("content")) or ""
+            if self._is_volatile_ignored_quarantine_placeholder(msg, text):
+                continue
+            if self._is_ignored_active_replay_placeholder(msg, text):
+                continue
+            identity = self._message_replay_identity(msg)
+            exact_only = (
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            )
+            if exact_only and (
+                not identity[2]
+                or recover_hermes_persisted_output_with_file_stat(
+                    normalize_content_value(msg.get("content")) or ""
+                )
+                is None
+            ):
+                # Without a tool-call id or a readable saved file, a
+                # persisted-output marker cannot be proven to be the stored
+                # row; the exact rules above persist it (duplicate over loss).
+                return None
+            candidates.append((idx, identity, exact_only))
+        if len(candidates) < self._ALIGNED_REPLAY_MIN_MATCHED:
+            return None
+
+        durable_end = stored_tail[-3:]
+        best: tuple[int, int] | None = None  # (bridged rows, cursor)
+        for end in range(self._ALIGNED_REPLAY_MIN_MATCHED - 1, len(candidates)):
+            if not any(self._aligned_candidate_matches(candidates[end], row) for row in durable_end):
+                continue
+            alignment = self._durable_end_alignment(candidates, end, stored_tail)
+            if alignment is None:
+                continue
+            bridged, first_host_only = alignment
+            cursor = candidates[end][0] + 1
+            if first_host_only is not None:
+                # LCM never stored this message. Persist from it onward so it
+                # is kept; the rows after it are stored again (duplicate over
+                # loss), bounded by the aligned block.
+                cursor = first_host_only
+            # Fewest bridged rows wins; ties keep the earlier end so an
+            # ambiguous repeat of the durable tail is persisted, not skipped.
+            if best is None or bridged < best[0]:
+                best = (bridged, cursor)
+        if best is None or best[1] <= 0:
+            return None
+        return best[1]
+
+    def _aligned_candidate_matches(
+        self,
+        candidate: tuple[int, tuple[str, str, str, str], bool],
+        stored: tuple[str, str, str, str],
+    ) -> bool:
+        _idx, identity, exact_only = candidate
+        if exact_only:
+            return identity == stored
+        return self._aligned_replay_equivalent(identity, stored)
+
+    def _durable_end_alignment(
+        self,
+        candidates: list[tuple[int, tuple[str, str, str, str], bool]],
+        end: int,
+        stored_tail: list[tuple[str, str, str, str]],
+    ) -> tuple[int, int | None] | None:
+        """Align ``candidates[:end + 1]`` backwards with the durable tail.
+
+        Returns ``(bridged rows, message index of the earliest host-only
+        message or None)``, or None when the prefix does not replay the
+        durable tail. Up to two rows on either side may be stepped over when
+        the other side matches right behind them. Store-only rows are simply
+        passed; host-only messages are reported so the caller persists them.
+        """
+        matches = self._aligned_candidate_matches
+        i = end
+        j = len(stored_tail) - 1
+        matched = 0
+        bridged = 0
+        first_host_only: int | None = None
+        roles: set[str] = set()
+        while i >= 0 and j >= 0:
+            candidate = candidates[i]
+            if matches(candidate, stored_tail[j]):
+                matched += 1
+                roles.add(candidate[1][0])
+                i -= 1
+                j -= 1
+                continue
+            store_skip = next(
+                (n for n in (1, 2) if j - n >= 0 and matches(candidate, stored_tail[j - n])),
+                None,
+            )
+            if store_skip is not None:
+                j -= store_skip
+                bridged += store_skip
+                continue
+            host_skip = next(
+                (n for n in (1, 2) if i - n >= 0 and matches(candidates[i - n], stored_tail[j])),
+                None,
+            )
+            if host_skip is None:
+                break
+            # candidates[i - host_skip + 1 .. i] are messages LCM does not hold.
+            first_host_only = candidates[i - host_skip + 1][0]
+            i -= host_skip
+            bridged += host_skip
+        if i >= 0:
+            # Replayable messages remain before the aligned block: this prefix
+            # is not a replay of the durable tail.
+            return None
+        if matched < self._ALIGNED_REPLAY_MIN_MATCHED:
+            return None
+        if "user" not in roles or "assistant" not in roles:
+            return None
+        if bridged > min(
+            self._ALIGNED_REPLAY_MAX_ONE_SIDED,
+            int(matched * self._ALIGNED_REPLAY_ONE_SIDED_RATIO) + 1,
+        ):
+            return None
+        return bridged, first_host_only
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

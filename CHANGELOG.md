@@ -18,6 +18,31 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 - `lcm_grep` accepts a stored session id passed as `session_scope` and searches
   that session, reporting a `scope_note`. Unknown values keep the documented
   fallback to the current session.
+- A gateway restart no longer re-stores the conversations it resumes. After a
+  restart the host rebuilds each session from its own transcript, which is
+  close to what LCM stored but not identical, and any difference broke the
+  exact-suffix proof so the whole resumed context was stored again. On one
+  production store, 15 of 103 recent sessions re-stored 1,887 rows on a single
+  simulated restart. Two changes:
+  - replay identity follows an externalized-payload ref only when the content
+    *is* the placeholder, not when a tool result (for example
+    `lcm_load_session` output) quotes one;
+  - when the exact proof fails, an aligner walks the resumed context and the
+    durable tail backwards from the durable end. It matches exact identities
+    plus a closed set of host views: stored multimodal parts as the host's text
+    view (images become `[screenshot]`), surrounding whitespace, and text one
+    side added at a line boundary (a folded task list, a recovery note around
+    the user's message). It bridges at most a few one-sided rows, requires at
+    least eight matched rows with both a user and an assistant turn, and stops
+    the cursor at the first message LCM does not hold so nothing is skipped
+    without a stored counterpart. Persisted-output markers keep their exact
+    rules.
+
+  The same simulation re-stores 282 rows across 3 sessions with the fix, each
+  for a reason the aligner deliberately does not override: persisted-output
+  markers whose saved file is gone (duplicate over loss, by design), a 72-row
+  stored block the host's own compaction removed from its active transcript
+  (too large to bridge), and the rows after a message LCM never stored.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
