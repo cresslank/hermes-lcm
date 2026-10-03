@@ -43,6 +43,15 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
   markers whose saved file is gone (duplicate over loss, by design), a 72-row
   stored block the host's own compaction removed from its active transcript
   (too large to bridge), and the rows after a message LCM never stored.
+- Externalizing a large tool result no longer summarizes the backlog early.
+  With active-replay stubbing on, a new tool-result stub asks the host for one
+  cleanup `compress()` pass below the threshold. That pass also ran any
+  eligible leaf work, so tool-heavy sessions kept compacting far below the
+  threshold (on one host, 301 of 308 compactions in a week were these passes,
+  about three minutes of summarizer time each). Below the threshold, cleanup now
+  adopts the stub without summarizing, a changed replay alone no longer
+  requests leaf work, and `compress()` re-checks the reason so a stale request
+  cannot divert a later threshold pass. Combines upstream PRs #642 and #541.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
