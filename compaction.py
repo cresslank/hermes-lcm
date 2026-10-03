@@ -68,7 +68,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        self._preflight_cleanup_only_no_summary = False
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -128,12 +128,23 @@ class CompactionMixin:
                 observed_tokens=replay_rough,
                 messages=replay_messages,
             )
+            # The host advertises its live prompt size, and that is the size the
+            # threshold speaks about. Below it, adopting the store's replay view
+            # must not buy summarizer work: a routine ingest stub (externalized
+            # payload, persisted tool output, quarantine placeholder) is enough
+            # to make the replay differ, and the host turns any request from here
+            # into a full leaf pass. Compare the larger of the live list and the
+            # replay: a filtered replay can be far smaller than the prompt it
+            # stands for, and either view at the threshold keeps normal work.
+            below_threshold = self._below_compaction_threshold(
+                max(rough, replay_rough)
+            )
             if cleanup_requested:
-                if (
-                    not force_overflow_requested
-                    and self._compression_boundary_cooldown_active()
+                if not force_overflow_requested and (
+                    below_threshold
+                    or self._compression_boundary_cooldown_active()
                 ):
-                    self._preflight_cleanup_only_due_to_boundary_cooldown = True
+                    self._preflight_cleanup_only_no_summary = True
                 return self._mark_preflight_compression_requested()
             if force_overflow_requested:
                 return self._mark_preflight_compression_requested()
@@ -143,6 +154,26 @@ class CompactionMixin:
             # result stub); those returns above are deterministic and add no
             # summarizer spend.
             if self._compression_boundary_cooldown_active():
+                return False
+            if below_threshold:
+                # The no-diff path refuses to advertise summarizer work below the
+                # threshold; a changed replay must not reintroduce it. Perform
+                # the same raw-backlog bookkeeping as that path so deferred
+                # maintenance still sees the debt.
+                self._refresh_raw_backlog_debt(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                )
+                if self._should_run_deferred_maintenance(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                ):
+                    return self._mark_preflight_compression_requested()
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = (
+                    "ingest replay changed below compaction threshold"
+                )
+                logger.info("LCM preflight compression no-op: %s", self._last_compression_noop_reason)
                 return False
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
@@ -200,6 +231,15 @@ class CompactionMixin:
         if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
             return self._mark_preflight_compression_requested()
         return False
+
+    def _below_compaction_threshold(self, tokens: int) -> bool:
+        """True when ``tokens`` cannot justify threshold-driven summary work.
+
+        Mirrors the no-diff preflight path: without a positive threshold, or
+        below it, only overflow recovery, boundary maintenance and opted-in
+        deferred maintenance may spend summarizer calls.
+        """
+        return self.threshold_tokens <= 0 or tokens < self.threshold_tokens
 
     def _replay_diff_requests_ingest_cleanup(
         self,
@@ -423,17 +463,34 @@ class CompactionMixin:
             else None
         )
 
+        # Consume the one-shot preflight handoff before the fallible ingest so
+        # a transient ingest failure cannot leave a stale flag behind.
+        preflight_cleanup_only_no_summary = self._preflight_cleanup_only_no_summary
+        self._preflight_cleanup_only_no_summary = False
+
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
-        cleanup_only_due_to_boundary_cooldown = bool(
-            self._preflight_cleanup_only_due_to_boundary_cooldown
+        # A preflight cleanup request that must not summarize (below the
+        # compaction threshold, or during a boundary cooldown) adopts the
+        # durable replay view through the deterministic sanitize path. Re-check
+        # the reason here: if the host skipped the compress() that preflight
+        # asked for, a later threshold-crossed call must still summarize.
+        cleanup_only_no_summary = bool(
+            preflight_cleanup_only_no_summary
             and not force_overflow
+            and (
+                self._compression_boundary_cooldown_active()
+                or self._below_compaction_threshold(
+                    observed_prompt_tokens
+                    if observed_prompt_tokens is not None and observed_prompt_tokens > 0
+                    else count_messages_tokens(messages)
+                )
+            )
         )
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        if cleanup_only_due_to_boundary_cooldown:
+        if cleanup_only_no_summary:
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
                 insert_missing_tool_stubs=False,
